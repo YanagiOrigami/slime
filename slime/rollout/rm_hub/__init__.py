@@ -11,6 +11,7 @@ from .f1 import f1_score
 from .math_dapo_utils import compute_score as compute_score_dapo
 from .math_utils import extract_answer as extract_boxed_answer
 from .math_utils import grade_answer_verl
+from .remote_code_judge import remote_code_judge
 
 
 async def remote_rm(args, sample: Sample):
@@ -42,6 +43,8 @@ async def async_rm(args, sample: Sample, **kwargs):
     # Implement the actual logic as needed.
     if rm_type == "remote_rm":
         return await remote_rm(args, sample)
+    if rm_type == "remote_code_judge":
+        return await remote_code_judge(response, label)
     elif rm_type == "deepscaler":
         return get_deepscaler_rule_based_reward(response, label)
     elif rm_type == "dapo":
