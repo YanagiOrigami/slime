@@ -84,7 +84,6 @@ class MegatronTrainRayActor(TrainRayActor):
             self.sleep(("model"))
 
         self.rollout_engines = None
-        self.data_buffer = None
 
         self.rollout_data_postprocess = None
         if self.args.rollout_data_postprocess_path is not None:
@@ -150,9 +149,6 @@ class MegatronTrainRayActor(TrainRayActor):
             mpu.reload_process_groups()
         print_memory("after wake_up model")
 
-    def set_data_buffer(self, data_buffer):
-        self.data_buffer = data_buffer
-
     def _get_rollout_data(self, rollout_data_ref):
         # Fetch data through ray on CPU, not sure if this will be performance bottleneck.
         # Both first pp stage and the last pp stage will recieve the data.
@@ -204,7 +200,6 @@ class MegatronTrainRayActor(TrainRayActor):
 
             if self.args.compute_advantages_and_returns:
                 if "ref" in self.weights:
-                    self.update_gpu_params_dict(self.weights["ref"])
                     rollout_data.update(
                         self.compute_log_prob(
                             "ref",
@@ -287,7 +282,7 @@ class MegatronTrainRayActor(TrainRayActor):
         if self.args.debug_train_only or self.args.debug_rollout_only:
             return
 
-        if hasattr(mpu, "reload_process_groups"):
+        if self.args.offload and hasattr(mpu, "reload_process_groups"):
             mpu.reload_process_groups()
 
         with torch_memory_saver.disable() if self.args.offload and not torch.version.hip else nullcontext():
@@ -299,7 +294,7 @@ class MegatronTrainRayActor(TrainRayActor):
                 print("update rollout model on cpu using actor model")
                 self.update_cpu_params_dict(self.weights["old_actor"])
 
-        if hasattr(mpu, "destroy_process_groups"):
+        if self.args.offload and hasattr(mpu, "destroy_process_groups"):
             mpu.destroy_process_groups()
 
     def load_other_checkpoint(self, model_tag, path):
