@@ -1,16 +1,17 @@
 MODEL_ARGS=(
    --swiglu
-   --num-layers 36
-   --hidden-size 2048
-   --ffn-hidden-size 11008
-   --num-attention-heads 16
+   --num-layers 64
+   --hidden-size 5120
+   --ffn-hidden-size 25600
+   --num-attention-heads 64
+   --group-query-attention
+   --num-query-groups 8
    --use-rotary-position-embeddings
    --disable-bias-linear
-   --add-qkv-bias
    --normalization "RMSNorm"
    --norm-epsilon 1e-6
    --rotary-base 1000000
-   --group-query-attention
-   --num-query-groups 2
    --vocab-size 151936
+   --kv-channels 128
+   --qk-layernorm
 )
