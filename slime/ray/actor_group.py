@@ -1,12 +1,11 @@
-from typing import Dict, Optional
 import os
+from typing import Optional
+
 import ray
 import torch
-
 from ray.util.placement_group import PlacementGroup
 from ray.util.scheduling_strategies import PlacementGroupSchedulingStrategy
 
-from slime.backends.megatron_utils import MegatronTrainRayActor
 from slime.ray.utils import NOSET_VISIBLE_DEVICES_ENV_VARS_LIST
 
 
@@ -38,17 +37,11 @@ class RayTrainGroup:
         pg: tuple[PlacementGroup, list[int]],
         wandb_run_id: Optional[str] = None,
         num_gpus_per_actor: float = 1,
-        resources: Optional[Dict[str, float] | None] = None,
-        num_resources_per_node: Optional[int | None] = None,
     ) -> None:
         self.args = args
         self._num_nodes = num_nodes
         self._num_gpus_per_node = num_gpus_per_node
         self._wandb_run_id = wandb_run_id
-
-        # custom resources, see https://docs.ray.io/en/latest/ray-core/scheduling/resources.html
-        self._resources = resources
-        self._num_resources_per_node = num_resources_per_node
 
         # Allocate the GPUs for actors w/o instantiating them
         self._allocate_gpus_for_actor(pg, num_gpus_per_actor, wandb_run_id=wandb_run_id)
@@ -80,10 +73,22 @@ class RayTrainGroup:
             env_vars["TMS_INIT_ENABLE"] = "1"
             env_vars["TMS_INIT_ENABLE_CPU_BACKUP"] = "1"
 
-        TrainRayActor = ray.remote(
-            num_gpus=1,
-            runtime_env={"env_vars": env_vars},
-        )(MegatronTrainRayActor)
+        backend = os.environ.get("SLIME_BACKEND", "megatron").lower()
+        if backend == "megatron":
+            from slime.backends.megatron_utils import MegatronTrainRayActor
+
+            actor_impl = MegatronTrainRayActor
+
+        elif backend == "xtuner":
+            from slime.backends.xtuner_utils.actor import XTunerTrainRayActor
+
+            actor_impl = XTunerTrainRayActor
+        else:
+            from slime.backends.fsdp_utils import FSDPTrainRayActor
+
+            actor_impl = FSDPTrainRayActor
+
+        TrainRayActor = ray.remote(num_gpus=1, runtime_env={"env_vars": env_vars})(actor_impl)
 
         # Create worker actors
         self._actor_handlers = []
@@ -92,7 +97,6 @@ class RayTrainGroup:
             actor = TrainRayActor.options(
                 num_cpus=num_gpus_per_actor,
                 num_gpus=num_gpus_per_actor,
-                resources=self._resources,
                 scheduling_strategy=PlacementGroupSchedulingStrategy(
                     placement_group=pg,
                     placement_group_bundle_index=reordered_bundle_indices[rank],
@@ -115,16 +119,11 @@ class RayTrainGroup:
         to update weights after each training stage.
         """
         self.rollout = rollout
+        rollout_engines, rollout_engine_lock = ray.get(rollout.get_rollout_engines_and_lock.remote())
         return [
-            actor.connect_rollout_engines.remote(
-                rollout.rollout_engines,
-                rollout.rollout_engine_lock,
-            )
+            actor.connect_rollout_engines.remote(rollout_engines, rollout_engine_lock)
             for actor in self._actor_handlers
         ]
-
-    def get_rollout_data(self, rollout_id):
-        ray.get([actor.get_rollout_data.remote(rollout_id) for actor in self._actor_handlers])
 
     def async_train(self, rollout_id, rollout_data_ref):
         """Do one rollout training"""
@@ -140,3 +139,9 @@ class RayTrainGroup:
 
     def async_offload(self):
         return [actor.sleep.remote(("model")) for actor in self._actor_handlers]
+
+    def async_connect(self, critic_group):
+        return [
+            actor.connect_actor_critic.remote((critic))
+            for actor, critic in zip(self._actor_handlers, critic_group._actor_handlers)
+        ]

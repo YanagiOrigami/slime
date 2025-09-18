@@ -1,14 +1,15 @@
-from typing import List
-import time
-import re
 import asyncio
-from .prompts import SOLVER_PROMPT_TEMPLATE, generate_rewriter_template, generate_select_template
-from copy import deepcopy
+import re
+import time
 import traceback
+from copy import deepcopy
+from typing import List
 
+from slime.rollout.rm_hub import batched_async_rm
 from slime.utils.http_utils import post
 from slime.utils.types import Sample
-from slime.rollout.rm_hub import batched_async_rm
+
+from .prompts import SOLVER_PROMPT_TEMPLATE, generate_rewriter_template, generate_select_template
 
 
 async def generate_response(args, prompt, key):
@@ -35,7 +36,7 @@ async def generate_response(args, prompt, key):
 
         payload = {"input_ids": input_token_ids, "sampling_params": current_sampling_params, "return_logprob": True}
 
-        output = await post(url, payload, use_http2=args.use_http2)
+        output = await post(url, payload)
 
         # Extract new response tokens
         if "output_token_logprobs" in output["meta_info"]:
