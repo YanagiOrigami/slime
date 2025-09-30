@@ -1,6 +1,7 @@
 from contextlib import nullcontext
 from itertools import accumulate
 
+import ray
 import torch
 import torch.distributed as dist
 from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
@@ -9,7 +10,6 @@ from torch_memory_saver import torch_memory_saver
 from transformers import AutoConfig, AutoModelForCausalLM, AutoProcessor, AutoTokenizer
 
 import wandb
-from slime.ray.registry import get_actors
 from slime.ray.train_actor import TrainRayActor
 from slime.utils.data import get_minimum_num_micro_batch_size, process_rollout_data
 from slime.utils.distributed_utils import get_gloo_group
@@ -99,7 +99,6 @@ class FSDPTrainRayActor(TrainRayActor):
 
         self.update_cpu_params_dict(self.weights["actor"])
 
-        self.connected = False
         self.weight_updator = (
             UpdateWeightFromTensor(self.args, self.model)
             if self.args.colocate
@@ -405,10 +404,10 @@ class FSDPTrainRayActor(TrainRayActor):
         if self.args.debug_train_only or self.args.debug_rollout_only:
             return
 
-        if not self.connected:
-            self.connected = True
-            rollout_engines = get_actors("rollout")
-            rollout_engine_lock = get_actors("rollout_lock", 0)
+        rollout_engines, rollout_engine_lock, num_new_engines = ray.get(
+            self.rollout_manager.get_rollout_engines_and_lock.remote()
+        )
+        if num_new_engines > 0:
             self.weight_updator.connect_rollout_engines(rollout_engines, rollout_engine_lock)
             dist.barrier(group=get_gloo_group())
 
