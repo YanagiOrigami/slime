@@ -16,6 +16,7 @@ set -ex
 
 #Judge Host IP Address
 export JUDGE_HOST=38.80.122.117
+export JUDGE_PORT=8081
 
 # will prevent ray from buffering stdout/stderr
 export PYTHONBUFFERED=16
@@ -35,31 +36,32 @@ CKPT_ARGS=(
    --hf-checkpoint /workspace/Qwen3-30B-A3B
    #--hf-checkpoint /workspace/Qwen3-30B-A3B-FP8
    --ref-load /workspace/Qwen3-30B-A3B_torch_dist
-   --load /workspace/Qwen3-30B-A3B_slime/
-   --save /workspace/Qwen3-30B-A3B_slime/
-   --save-interval 20
+   --load /workspace/Qwen3-30B-A3B_slime/20251011/
+   --save /workspace/Qwen3-30B-A3B_slime/20251011/
+   --save-interval 10
 )
 
 ROLLOUT_ARGS=(
-   --prompt-data /workspace/lcbp/train.jsonl
+   --prompt-data /workspace/lcbp/train_small_unsolvable.jsonl
    --input-key prompt
    --label-key label
    --apply-chat-template
    --rollout-shuffle
-   --rm-type remote_code_judge
-   --num-rollout 300
-   --rollout-batch-size 8
+   --rm-type partial_credit_judge
+   --num-rollout 200
+   --rollout-batch-size 4
    --n-samples-per-prompt 8
-   --rollout-max-response-len 8192
+   --rollout-max-response-len 16384
    --rollout-temperature 0.8
 
-   --global-batch-size 64
+   --num-steps-per-rollout 1
+   #--global-batch-size 64
    --balance-data
 )
 
 EVAL_ARGS=(
-   --eval-interval 20
-   --eval-prompt-data /workspace/lcbp/eval.jsonl
+   --eval-interval 100
+   --eval-prompt-data /workspace/lcbp/train_small_unsolvable.jsonl
    --n-samples-per-eval-prompt 1
    --eval-max-response-len 16384
    --eval-top-p 0.7
@@ -77,9 +79,9 @@ PERF_ARGS=(
    --recompute-method uniform
    --recompute-num-layers 1
 
-   # --micro-batch-size 1
-   --use-dynamic-batch-size
-   --max-tokens-per-gpu 20480
+   --micro-batch-size 1
+   # --use-dynamic-batch-size
+   --max-tokens-per-gpu 32768
 )
 
 GRPO_ARGS=(
@@ -106,16 +108,17 @@ OPTIMIZER_ARGS=(
 )
 
 WANDB_ARGS=(
-   #--use-wandb
-   # --wandb-project CPRL
-   # --wandb-group qwen3-30B-A3B
-   # --wandb-key ${WANDB_KEY}
+   --use-wandb
+   --wandb-project CPRL
+   --wandb-group qwen3-30B-A3B
+   --wandb-key ${WANDB_KEY}
 )
 
 SGLANG_ARGS=(
    --rollout-num-gpus-per-engine 8
-   --sglang-mem-fraction-static 0.7
+   --sglang-mem-fraction-static 0.6
    --sglang-cuda-graph-bs 1 2 4 8 $(seq 16 8 256)
+   #--sglang-cuda-graph-max-bs 16
 )
 
 MISC_ARGS=(
@@ -158,4 +161,4 @@ ray job submit --address="http://127.0.0.1:8265" \
    ${PERF_ARGS[@]} \
    ${EVAL_ARGS[@]} \
    ${SGLANG_ARGS[@]} \
-   ${MISC_ARGS[@]} \
+   ${MISC_ARGS[@]}

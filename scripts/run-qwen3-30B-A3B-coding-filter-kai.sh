@@ -16,6 +16,7 @@ set -ex
 
 #Judge Host IP Address
 export JUDGE_HOST=38.80.122.117
+export JUDGE_PORT=8081
 
 # will prevent ray from buffering stdout/stderr
 export PYTHONBUFFERED=16
@@ -37,29 +38,32 @@ CKPT_ARGS=(
    --ref-load /workspace/Qwen3-30B-A3B_torch_dist
    --load /workspace/Qwen3-30B-A3B_slime/
    --save /workspace/Qwen3-30B-A3B_slime/
-   --save-interval 20
+   --save-interval 100
 )
 
 ROLLOUT_ARGS=(
-   --prompt-data /workspace/lcbp/train.jsonl
+   #--prompt-data /workspace/lcbp/train_filt.jsonl
+   --prompt-data /workspace/lcbp/train_single_problem.jsonl
    --input-key prompt
    --label-key label
    --apply-chat-template
    --rollout-shuffle
    --rm-type remote_code_judge
-   --num-rollout 300
-   --rollout-batch-size 8
-   --n-samples-per-prompt 8
-   --rollout-max-response-len 8192
+   --num-rollout 3
+   --rollout-batch-size 1
+   --n-samples-per-prompt 32
+   --rollout-max-response-len 16384
    --rollout-temperature 0.8
 
-   --global-batch-size 64
-   --balance-data
+   --num-steps-per-rollout 1
+   #--global-batch-size 64
+   #--balance-data
 )
 
 EVAL_ARGS=(
-   --eval-interval 20
-   --eval-prompt-data /workspace/lcbp/eval.jsonl
+   --eval-interval 100
+   #--eval-prompt-data /workspace/lcbp/train_filt.jsonl
+   --eval-prompt-data /workspace/lcbp/train_single_problem.jsonl
    --n-samples-per-eval-prompt 1
    --eval-max-response-len 16384
    --eval-top-p 0.7
@@ -77,8 +81,8 @@ PERF_ARGS=(
    --recompute-method uniform
    --recompute-num-layers 1
 
-   # --micro-batch-size 1
-   --use-dynamic-batch-size
+   --micro-batch-size 1
+   # --use-dynamic-batch-size
    --max-tokens-per-gpu 20480
 )
 
@@ -105,17 +109,18 @@ OPTIMIZER_ARGS=(
    --use-precision-aware-optimizer
 )
 
-WANDB_ARGS=(
-   #--use-wandb
-   # --wandb-project CPRL
-   # --wandb-group qwen3-30B-A3B
-   # --wandb-key ${WANDB_KEY}
-)
+# WANDB_ARGS=(
+#    --use-wandb
+#    --wandb-project CPRL
+#    --wandb-group qwen3-30B-A3B
+#    --wandb-key ${WANDB_KEY}
+# )
 
 SGLANG_ARGS=(
    --rollout-num-gpus-per-engine 8
-   --sglang-mem-fraction-static 0.7
+   --sglang-mem-fraction-static 0.6
    --sglang-cuda-graph-bs 1 2 4 8 $(seq 16 8 256)
+   --sglang-cuda-graph-max-bs 16
 )
 
 MISC_ARGS=(
@@ -159,3 +164,5 @@ ray job submit --address="http://127.0.0.1:8265" \
    ${EVAL_ARGS[@]} \
    ${SGLANG_ARGS[@]} \
    ${MISC_ARGS[@]} \
+   --debug-rollout-only \
+   --save-debug-rollout-data /workspace/lcbp/debug_rollout_data/easy_data_{rollout_id}.pt
