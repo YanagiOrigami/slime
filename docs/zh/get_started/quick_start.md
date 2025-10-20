@@ -272,6 +272,10 @@ GRPO_ARGS=(
 )
 ```
 
+- `--advantage-estimator`: 除去 [GRPO](https://arxiv.org/abs/2402.03300)，slime 还支持丰富的其他训练算法，例如 [GSPO](https://arxiv.org/abs/2507.18071)、[Reinforce++](https://arxiv.org/abs/2501.03262) 与 [Reinforce++ Baseline](https://arxiv.org/abs/2501.03262)、以及 [PPO](https://arxiv.org/abs/1707.06347)；
+- `--calculate-per-token-loss`：slime 中默认的方案是 per sample loss，即 `mean(sum(sample_i) / len(sample_i))`，如果需要计算 per token loss，即 `sum(sum(sample_i)) / sum(len(sample_i))`，可以开启 `--calculate-per-token-loss`；
+- `--use-tis`：如果需要开启 TIS (Truncated Importance Sampling)，可以开启这一设置。TIS 由此[博客](https://fengyao.notion.site/off-policy-rl)介绍。
+
 ### OPTIMIZER_ARGS: 优化器参数
 
 ```bash
@@ -401,7 +405,7 @@ hf download Qwen/Qwen3-4B-FP8 --local-dir /root/Qwen3-4B-FP8
    # 用于加载 tokenizer 等其他信息，实际上不会使用 hf 路径中的模型权重参数
    --hf-checkpoint /root/Qwen3-4B-FP8
 
-   #  megatron checkpoint 还需要是最开始用 bf16 的 huggingface 转换的 dist 权重，不因为 FP rollout 而去做修改。
+   #  megatron checkpoint 还需要是最开始用 bf16 的 huggingface 转换的 dist 权重，不因为 FP8 rollout 而去做修改。
    --ref-load /root/Qwen3-4B_torch_dist
 ```
 
@@ -517,7 +521,7 @@ async def generate(args, sample: Sample, sampling_params) -> Sample:
     # 7. 填充并返回 Sample 对象
     sample.response = full_response
     sample.tokens = ...
-    sample.loss_masks = loss_masks
+    sample.loss_mask = loss_masks
     return sample
 ```
 

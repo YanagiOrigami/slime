@@ -1,7 +1,6 @@
 """Data packing utilities for FSDP backend to reduce padding overhead."""
 
 import math
-from typing import Dict, List, Optional
 
 import torch
 
@@ -9,16 +8,17 @@ from slime.utils.seqlen_balancing import get_seqlen_balanced_partitions
 
 
 def pack_sequences(
-    tokens: List[List[int]],
-    loss_masks: List[List[int]],
-    rewards: List[float],
-    raw_rewards: List,
-    response_lengths: List[int],
-    advantages: List[float],
-    returns: List[float],
-    max_tokens_per_gpu: Optional[int] = None,
-    num_packs: Optional[int] = None,
-) -> List[Dict]:
+    tokens: list[list[int]],
+    loss_masks: list[list[int]],
+    rewards: list[float],
+    raw_rewards: list,
+    response_lengths: list[int],
+    advantages: list[float],
+    returns: list[float],
+    rollout_log_probs: list[list[float]] | None = None,
+    max_tokens_per_gpu: int | None = None,
+    num_packs: int | None = None,
+) -> list[dict]:
     """
     Pack sequences into dense batches with cumulative sequence lengths.
 
@@ -65,6 +65,8 @@ def pack_sequences(
         flat_positionids = []
         flat_advantages = []
         flat_returns = []
+        flat_rollout_log_probs = []
+
         for i in indices:
             seq_tokens = tokens[i]
             seq_mask = loss_masks[i]
@@ -75,6 +77,8 @@ def pack_sequences(
             flat_masks.extend(seq_mask)
             flat_advantages.extend(advantages[i])
             flat_returns.extend(returns[i])
+            if rollout_log_probs:
+                flat_rollout_log_probs.extend(rollout_log_probs[i])
             cu_seqlens.append(cu_seqlens[-1] + len(seq_tokens))
         result.append(
             {
@@ -87,13 +91,14 @@ def pack_sequences(
                 "response_lengths": [response_lengths[i] for i in indices],
                 "advantages": torch.tensor(flat_advantages, dtype=torch.float32),
                 "returns": torch.tensor(flat_returns, dtype=torch.float32),
+                "rollout_log_probs": torch.tensor(flat_rollout_log_probs, dtype=torch.float32),
             }
         )
 
     return result
 
 
-def unpack_sequences(packed_batch: Dict) -> List[Dict]:
+def unpack_sequences(packed_batch: dict) -> list[dict]:
     """
     Unpack sequences from a packed batch.
 
@@ -121,7 +126,11 @@ def unpack_sequences(packed_batch: Dict) -> List[Dict]:
                 # For tensor attributes, we need to slice them appropriately
                 if isinstance(value, torch.Tensor):
                     if key in ["log_probs", "ref_log_probs", "cur_log_probs"]:
+                        # These are computed from logits[:-1] so they have length seq_len-1
                         instance[key] = value[end_idx - 1 - response_lengths[i] : end_idx - 1]
+                    elif key == "rollout_log_probs":
+                        # rollout_log_probs is packed based on response_lengths, so slice differently
+                        instance[key] = value[sum(response_lengths[:i]) : sum(response_lengths[: i + 1])]
                     elif key in ["tokens", "position_ids"]:
                         # For other tensor attributes, try to slice them
                         if len(value) > start_idx:

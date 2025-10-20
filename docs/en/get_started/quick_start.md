@@ -273,6 +273,10 @@ GRPO_ARGS=(
 )
 ```
 
+- `--advantage-estimator`: In addition to [GRPO](https://arxiv.org/abs/2402.03300), slime also supports several other training algorithms, such as [GSPO](https://arxiv.org/abs/2507.18071), [Reinforce++](https://arxiv.org/abs/2501.03262) and [Reinforce++ Baseline](https://arxiv.org/abs/2501.03262), and [PPO](https://arxiv.org/abs/1707.06347).
+- `--calculate-per-token-loss`: By default, slime calculates the loss on a per-sample basis, i.e., `mean(sum(sample_i) / len(sample_i))`. To calculate the loss on a per-token basis, i.e., `sum(sum(sample_i)) / sum(len(sample_i))`, you can enable this flag.
+- `--use-tis`: Enable this setting to use TIS (Truncated Importance Sampling), which is introduced by this [blog](https://fengyao.notion.site/off-policy-rl).
+
 ### OPTIMIZER_ARGS: Optimizer Parameters
 
 ```bash
@@ -397,7 +401,7 @@ And replace `--hf-checkpoint` with:
    # Used to load tokenizer and other information, actually won't use model weight parameters from hf path
    --hf-checkpoint /root/Qwen3-4B-FP8
 
-   # The megatron checkpoint still needs to be the dist weights converted from bf16 huggingface at the beginning, not modified because of FP rollout.
+   # The megatron checkpoint still needs to be the dist weights converted from bf16 huggingface at the beginning, not modified because of FP8 rollout.
    --ref-load /root/Qwen3-4B_torch_dist
 ```
 
@@ -511,7 +515,7 @@ async def generate(args, sample: Sample, sampling_params) -> Sample:
     # 7. Fill and return Sample object
     sample.response = full_response
     sample.tokens = ...
-    sample.loss_masks = loss_masks
+    sample.loss_mask = loss_masks
     return sample
 ```
 
