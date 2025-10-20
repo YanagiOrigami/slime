@@ -3,9 +3,116 @@ import re
 import random
 import asyncio
 import aiohttp
+import json
+
+import os, json, re, aiohttp
+
+async def partial_credit_judge(response: str, label: str) -> float:
+    judgeHost = os.getenv("JUDGE_HOST", "LightCPVerifier")
+    judgePort = os.getenv("JUDGE_PORT", "8081")
+    judgeBaseUrl = f"http://{judgeHost}:{judgePort}"
+
+    pid = label[:5]
+    if len(label) > 5 and label[5] not in [' ', '_']:
+        pid = label[:6]
+
+    code, lang = _extract_code(response)
+    if code:
+        sid = await _submit_code(pid=pid, lang=lang, code=code, baseUrl=judgeBaseUrl)
+        if sid:
+            res = await _wait_for_result(sid, judgeBaseUrl)
+            if res:
+                return 1.0
+    else:
+        return -0.1  # No code found, return a negative score to indicate failure
+
+    try:
+        gpt_api = os.getenv("GPT_API", "https://api.openai.com/v1/responses")
+        gpt_key = os.getenv("GPT_KEY", "")
+
+        prompt = f"""
+You are a competitive programming expert, and are very good at evaluating the quality of solutions. 
+Here a newbee gives a solution to a problem but it failed to pass all test cases.
+Your job is to evaluate how good the solution is, and give a score between 0.0 to 1.0 (inclusive).
+Here is his code solution:
+{code}
+And here for your reference, is the problem statement and the standard solution:
+{label}
+Please analyze the solution by identifying the key ideas, match them with the reference, 
+and give a float score that reflects how far the submitted solution deviates from the standard one.
+Your final answer should be ONLY the float number, nothing else.
+"""
+
+        async with aiohttp.ClientSession() as session:
+            headers = {"Content-Type": "application/json"}
+            if gpt_key:
+                headers["Authorization"] = f"Bearer {gpt_key}"            
+
+            payload = {
+                "model": "o4-mini",
+                "reasoning": {"effort": "high"},
+                "input": prompt
+            }
+
+            async with session.post(gpt_api, headers=headers, data=json.dumps(payload)) as r:
+                if r.status == 200:
+                    data = await r.json()
+                    # Responses API 输出在 data["output"] 中
+                    text_output = ""
+                    for item in data.get("output", []):
+                        if item.get("type") == "message":
+                            parts = item.get("content", [])
+                            for p in parts:
+                                if p.get("type") == "output_text":
+                                    text_output += p.get("text", "")
+                    raw_output = text_output.strip()
+
+                    try:
+                        score = float(re.findall(r"[-+]?\d*\.?\d+", raw_output)[0])
+                        return min(max(score, 0.0), 1.0) * 0.8
+                    except Exception:
+                        return 0.0
+                else:
+                    return 0.0
+    except Exception:
+        return 0.0
+
+    return 0.0
 
 async def remote_code_judge(response: str, label: str) -> float:
-    return random.random()
+    """提取 C++ 代码 -> 提交到评测机 -> 等待结果 -> 返回部分分数"""
+    judgeHost = os.getenv("JUDGE_HOST", "LightCPVerifier")
+    judgePort = os.getenv("JUDGE_PORT", "8081")
+    judgeBaseUrl = f"http://{judgeHost}:{judgePort}"
+
+    code, lang = _extract_code(response)
+    if not code:
+        return -1.0
+
+    sid = await _submit_code(pid = label, lang = lang, code = code, baseUrl = judgeBaseUrl)
+    if not sid:
+        return 0.0
+
+    try:
+        async with aiohttp.ClientSession() as session:
+            for _ in range(30):
+                async with session.get(f"{judgeBaseUrl}/result/{sid}") as r:
+                    if r.status == 200:
+                        data = await r.json()
+                        if data.get("status") == "done":
+                            if data.get("passed", False):
+                                return 1.0
+                            if data.get("cases"):
+                                total_cases = len(data["cases"])
+                                passed_cases = total_cases - 1
+                                return 0.015 * passed_cases
+
+                await asyncio.sleep(1)
+    except Exception as e:
+        print(f"Query failed: {e}")
+    return 0.0
+        
+async def remote_01_code_judge(response: str, label: str) -> float:
     """提取 C++ 代码 -> 提交到评测机 -> 等待结果 -> 返回 1.0/0.0"""
     judgeHost = os.getenv("JUDGE_HOST", "LightCPVerifier")
     judgePort = os.getenv("JUDGE_PORT", "8081")
@@ -38,7 +145,7 @@ def _extract_code(response: str) -> tuple[str, str]:
     code_blocks = []
     
     # 匹配带语言标识的代码块
-    pattern_with_lang = r"```(\w+)\n(.*?)\n```"
+    pattern_with_lang = r"```([^\s`\n]+)[ \t]*\r?\n?([\s\S]*?)\r?\n?```"
     matches = re.finditer(pattern_with_lang, response, re.DOTALL)
     for match in matches:
         lang = match.group(1).lower()
@@ -46,7 +153,7 @@ def _extract_code(response: str) -> tuple[str, str]:
         code_blocks.append((code, lang))
     
     # 匹配无语言标识的代码块
-    pattern_no_lang = r"```\n(.*?)\n```"
+    pattern_no_lang = r"```(?![A-Za-z])[\t ]*\r?\n?([\s\S]*?)\r?\n?```"
     matches = re.finditer(pattern_no_lang, response, re.DOTALL)
     for match in matches:
         code = match.group(1).strip()
