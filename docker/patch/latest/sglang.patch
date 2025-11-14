@@ -1,8 +1,28 @@
+diff --git a/python/sglang/srt/entrypoints/engine.py b/python/sglang/srt/entrypoints/engine.py
+index ebab42a8f..05b2cb466 100644
+--- a/python/sglang/srt/entrypoints/engine.py
++++ b/python/sglang/srt/entrypoints/engine.py
+@@ -179,6 +179,7 @@ class Engine(EngineBase):
+         lora_path: Optional[List[Optional[str]]] = None,
+         custom_logit_processor: Optional[Union[List[str], str]] = None,
+         return_hidden_states: bool = False,
++        return_routed_experts: bool = False,
+         stream: bool = False,
+         bootstrap_host: Optional[Union[List[str], str]] = None,
+         bootstrap_port: Optional[Union[List[int], int]] = None,
+@@ -213,6 +214,7 @@ class Engine(EngineBase):
+             lora_path=lora_path,
+             custom_logit_processor=custom_logit_processor,
+             return_hidden_states=return_hidden_states,
++            return_routed_experts=return_routed_experts,
+             stream=stream,
+             bootstrap_host=bootstrap_host,
+             bootstrap_port=bootstrap_port,
 diff --git a/python/sglang/srt/entrypoints/http_server.py b/python/sglang/srt/entrypoints/http_server.py
-index c64e309c4..6001c3b39 100644
+index 76e999498..c098f1d37 100644
 --- a/python/sglang/srt/entrypoints/http_server.py
 +++ b/python/sglang/srt/entrypoints/http_server.py
-@@ -394,6 +394,10 @@ async def validate_json_request(raw_request: Request):
+@@ -403,6 +403,10 @@ async def validate_json_request(raw_request: Request):
  
  
  @app.get("/health")
@@ -13,132 +33,550 @@ index c64e309c4..6001c3b39 100644
  @app.get("/health_generate")
  async def health_generate(request: Request) -> Response:
      """
+diff --git a/python/sglang/srt/layers/moe/routed_experts_capturer.py b/python/sglang/srt/layers/moe/routed_experts_capturer.py
+new file mode 100644
+index 000000000..a15b73501
+--- /dev/null
++++ b/python/sglang/srt/layers/moe/routed_experts_capturer.py
+@@ -0,0 +1,206 @@
++import logging
++from abc import ABC
++from typing import Optional
++
++import numpy as np
++import torch
++
++from sglang.srt.configs.model_config import ModelConfig
++from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
++from sglang.srt.server_args import get_global_server_args
++
++logger = logging.getLogger(__name__)
++
++_GB = 1024 * 1024 * 1024
++_MB = 1024 * 1024
++
++
++def get_tensor_size_bytes(t: torch.Tensor):
++    return np.prod(t.shape) * t.dtype.itemsize
++
++
++class _RoutedExpertsDeviceCache:
++    def __init__(
++        self, model_config: ModelConfig, max_running_requests: int, device: str
++    ) -> None:
++        self.buffer = torch.zeros(
++            (
++                max(
++                    get_global_server_args().chunked_prefill_size, max_running_requests
++                ),
++                model_config.hf_text_config.num_hidden_layers,
++                model_config.hf_text_config.num_experts_per_tok,
++            ),
++            dtype=torch.int32,
++            device=device,
++        )
++        self._finalize_allocation_log()
++
++    def get_buffer_size_bytes(self):
++        assert hasattr(self, "buffer")
++        return get_tensor_size_bytes(self.buffer)
++
++    def capture_fwd_routed_experts(self, layer_id: int, topk_ids: torch.Tensor):
++        assert layer_id is not None, "capturing routing experts but get layer_id None"
++        batch, _ = topk_ids.shape
++        self.buffer[:batch, layer_id, :] = topk_ids
++
++    def _finalize_allocation_log(self):
++        """Common logging and memory usage computation for captured experts buffers."""
++        buffer_size_MB = self.get_buffer_size_bytes() / _MB
++        logger.info(
++            f"Routing experts device buffer allocated. #shape: {tuple(self.buffer.shape)}, size: {buffer_size_MB:.2f} MB"
++        )
++
++
++class _RoutedExpertsHostCache:
++    def __init__(
++        self,
++        model_config: ModelConfig,
++        num_tokens: int,
++    ) -> None:
++        self.num_tokens = num_tokens
++        self.buffer = torch.zeros(
++            (
++                num_tokens,
++                model_config.hf_text_config.num_hidden_layers,
++                model_config.hf_text_config.num_experts_per_tok,
++            ),
++            dtype=torch.int32,
++            device="cpu",
++        )
++        self._finalize_allocation_log()
++
++    def get_buffer_size_bytes(self):
++        assert hasattr(self, "buffer")
++        return get_tensor_size_bytes(self.buffer)
++
++    def set_experts_buffer(self, layer_id: int, loc: torch.Tensor, top_k: torch.Tensor):
++        self.buffer[layer_id, loc, :] = top_k.cpu()
++
++    def _finalize_allocation_log(self):
++        """Common logging and memory usage computation for captured experts buffers."""
++        buffer_size_GB = self.get_buffer_size_bytes() / _GB
++        logger.info(
++            f"Routing experts host buffer allocated. #tokens: {self.num_tokens}, size: {buffer_size_GB:.2f} GB"
++        )
++
++
++class RoutedExpertsCapturer(ABC):
++    @staticmethod
++    def create(
++        enable: bool,
++        model_config: ModelConfig,
++        num_tokens: int,
++        max_running_requests: int,
++        device: str,
++    ):
++        if enable:
++            return _RoutedExpertsCapturerReal(
++                model_config,
++                num_tokens=num_tokens,
++                max_running_requests=max_running_requests,
++                device=device,
++            )
++        else:
++            return _RoutedExpertsCapturerNoop()
++
++    def capture(self, layer_id: int, topk_ids: torch.Tensor):
++        raise NotImplementedError
++
++    def get_routed_experts(
++        self,
++        req_pool_idx: int,
++        seqlen: int,
++        req_to_token_pool: ReqToTokenPool,
++    ):
++        raise NotImplementedError
++
++    def sync_fwd_experts_buffer_DtoH(self, batch: int, loc: torch.Tensor):
++        raise NotImplementedError
++
++    def get_host_cache(self):
++        raise NotImplementedError
++
++    def get_device_cache(self):
++        raise NotImplementedError
++
++
++class _RoutedExpertsCapturerReal(RoutedExpertsCapturer):
++    """Capturer for routed experts with host buffer"""
++
++    def __init__(
++        self,
++        model_config: ModelConfig,
++        num_tokens: int,
++        max_running_requests: int,
++        device: str,
++    ):
++
++        self.host_cache = _RoutedExpertsHostCache(model_config, num_tokens)
++
++        self.device_cache = _RoutedExpertsDeviceCache(
++            model_config, max_running_requests, device
++        )
++
++    def capture(self, layer_id: int, topk_ids: torch.Tensor):
++        self.device_cache.capture_fwd_routed_experts(layer_id, topk_ids)
++
++    def sync_fwd_experts_buffer_DtoH(self, loc: torch.Tensor):
++        batch = loc.shape[0]
++        self.host_cache.buffer[loc] = self.device_cache.buffer[:batch].cpu()
++
++    def get_routed_experts(
++        self,
++        req_pool_idx: int,
++        seqlen: int,
++        req_to_token_pool: ReqToTokenPool,
++    ):
++        cache_pool_idx = (
++            req_to_token_pool.req_to_token[req_pool_idx][:seqlen].cpu().clone()
++        )
++
++        return self.get_host_cache().buffer[cache_pool_idx].tolist()
++
++    def get_host_cache(self):
++        return self.host_cache
++
++    def get_device_cache(self):
++        return self.device_cache
++
++
++class _RoutedExpertsCapturerNoop(RoutedExpertsCapturer):
++    def __init__(self):
++        pass
++
++    def capture(self, layer_id: int, topk_ids: torch.Tensor):
++        pass
++
++    def get_routed_experts(
++        self,
++        req_pool_idx: int,
++        seqlen: int,
++        req_to_token_pool: ReqToTokenPool,
++    ):
++        pass
++
++    def sync_fwd_experts_buffer_DtoH(self, loc: torch.Tensor):
++        pass
++
++    def get_host_cache(self):
++        pass
++
++    def get_device_cache(self):
++        pass
++
++
++_global_expert_capturer: Optional[RoutedExpertsCapturer] = _RoutedExpertsCapturerNoop()
++
++
++def get_global_experts_capturer():
++    return _global_expert_capturer
++
++
++def set_global_experts_capturer(capturer: RoutedExpertsCapturer):
++    global _global_expert_capturer
++    _global_expert_capturer = capturer
+diff --git a/python/sglang/srt/layers/moe/topk.py b/python/sglang/srt/layers/moe/topk.py
+index 203cd5f41..dad8515f5 100644
+--- a/python/sglang/srt/layers/moe/topk.py
++++ b/python/sglang/srt/layers/moe/topk.py
+@@ -44,6 +44,7 @@ from sglang.srt.eplb.expert_location_dispatch import (
+ )
+ from sglang.srt.layers.dp_attention import is_allocation_symmetric
+ from sglang.srt.layers.moe import get_moe_runner_backend
++from sglang.srt.layers.moe.routed_experts_capturer import get_global_experts_capturer
+ from sglang.srt.utils import (
+     cpu_has_amx_support,
+     get_bool_env_var,
+@@ -195,6 +196,7 @@ class TopK(CustomOp):
+         self,
+         top_k: int,
+         *,
++        layer_id: Optional[int] = None,
+         use_grouped_topk: bool = False,
+         topk_group: Optional[int] = None,
+         num_expert_group: Optional[int] = None,
+@@ -215,6 +217,7 @@ class TopK(CustomOp):
+         if use_grouped_topk:
+             assert num_expert_group is not None and topk_group is not None
+ 
++        self.layer_id = layer_id
+         self.topk_config = TopKConfig(
+             top_k=top_k,
+             use_grouped_topk=use_grouped_topk,
+@@ -240,6 +243,7 @@ class TopK(CustomOp):
+         self.topk_config.torch_native = True
+         return select_experts(
+             hidden_states=hidden_states,
++            layer_id=self.layer_id,
+             router_logits=router_logits,
+             topk_config=self.topk_config,
+             num_token_non_padded=num_token_non_padded,
+@@ -289,6 +293,7 @@ class TopK(CustomOp):
+             ):
+                 topk_output = select_experts(
+                     hidden_states=hidden_states,
++                    layer_id=self.layer_id,
+                     router_logits=router_logits,
+                     topk_config=self.topk_config,
+                     num_token_non_padded=num_token_non_padded,
+@@ -306,6 +311,7 @@ class TopK(CustomOp):
+     ) -> TopKOutput:
+         return select_experts(
+             hidden_states=hidden_states,
++            layer_id=self.layer_id,
+             router_logits=router_logits,
+             topk_config=self.topk_config,
+             num_token_non_padded=num_token_non_padded,
+@@ -387,6 +393,7 @@ class TopK(CustomOp):
+             self.topk_config.torch_native = True
+             return select_experts(
+                 hidden_states=hidden_states,
++                layer_id=self.layer_id,
+                 router_logits=router_logits,
+                 topk_config=self.topk_config,
+                 num_token_non_padded=num_token_non_padded,
+@@ -823,6 +830,7 @@ def select_experts(
+     router_logits: torch.Tensor,
+     topk_config: TopKConfig,
+     *,
++    layer_id: Optional[int] = None,
+     num_token_non_padded: Optional[torch.Tensor] = None,
+     expert_location_dispatch_info: Optional[ExpertLocationDispatchInfo] = None,
+ ) -> StandardTopKOutput:
+@@ -920,7 +928,10 @@ def select_experts(
+         )
+ 
+     get_global_expert_distribution_recorder().on_select_experts(topk_ids=topk_ids)
+-
++    get_global_experts_capturer().capture(
++        layer_id=layer_id,
++        topk_ids=topk_ids,
++    )
+     return StandardTopKOutput(topk_weights, topk_ids, router_logits)
+ 
+ 
+diff --git a/python/sglang/srt/managers/detokenizer_manager.py b/python/sglang/srt/managers/detokenizer_manager.py
+index 9399bbbea..91fbf80ab 100644
+--- a/python/sglang/srt/managers/detokenizer_manager.py
++++ b/python/sglang/srt/managers/detokenizer_manager.py
+@@ -273,6 +273,7 @@ class DetokenizerManager(MultiHttpWorkerDetokenizerMixin):
+             output_token_ids_logprobs_idx=recv_obj.output_token_ids_logprobs_idx,
+             output_token_entropy_val=recv_obj.output_token_entropy_val,
+             output_hidden_states=recv_obj.output_hidden_states,
++            output_routed_experts=recv_obj.output_routed_experts,
+             placeholder_tokens_idx=None,
+             placeholder_tokens_val=None,
+             retraction_counts=recv_obj.retraction_counts,
+diff --git a/python/sglang/srt/managers/io_struct.py b/python/sglang/srt/managers/io_struct.py
+index b22f98fbd..3513a9f14 100644
+--- a/python/sglang/srt/managers/io_struct.py
++++ b/python/sglang/srt/managers/io_struct.py
+@@ -175,6 +175,8 @@ class GenerateReqInput(BaseReq):
+     log_metrics: bool = True
+     # Whether to return hidden states
+     return_hidden_states: Union[List[bool], bool] = False
++    # Whether to return captured routed experts
++    return_routed_experts: bool = False
+ 
+     # The modalities of the image data [image, multi-images, video]
+     modalities: Optional[List[str]] = None
+@@ -592,6 +594,7 @@ class GenerateReqInput(BaseReq):
+                 if isinstance(self.return_hidden_states, list)
+                 else self.return_hidden_states
+             ),
++            return_routed_experts=self.return_routed_experts,
+             modalities=self.modalities[i] if self.modalities else None,
+             session_params=self.session_params,
+             lora_path=self.lora_path[i] if self.lora_path is not None else None,
+@@ -655,6 +658,9 @@ class TokenizedGenerateReqInput(BaseReq):
+     # Whether to return hidden states
+     return_hidden_states: bool = False
+ 
++    # Whether to return captured routed experts
++    return_routed_experts: bool = False
++
+     # The input embeds
+     input_embeds: Optional[Union[List[List[List[float]]], List[List[float]]]] = None
+ 
+@@ -910,6 +916,9 @@ class BatchTokenIDOutput(
+     # Hidden states
+     output_hidden_states: List[List[float]]
+ 
++    # The routed experts for each output token
++    output_routed_experts: List[List[int]]
++
+     # The information of placeholder tokens (e.g., image token)
+     # idx is the index of the token in the prompt after expansion.
+     # val is the length of padded tokens after expansion.
+@@ -989,6 +998,9 @@ class BatchStrOutput(
+     # Hidden states
+     output_hidden_states: List[List[float]]
+ 
++    # The routed experts for each output token
++    output_routed_experts: List[List[int]]
++
+     # The information of placeholder tokens (e.g., image token)
+     # idx is the index of the token in the prompt after expansion.
+     # val is the length of padded tokens after expansion.
+diff --git a/python/sglang/srt/managers/schedule_batch.py b/python/sglang/srt/managers/schedule_batch.py
+index 326b010b2..b7e24cfcf 100644
+--- a/python/sglang/srt/managers/schedule_batch.py
++++ b/python/sglang/srt/managers/schedule_batch.py
+@@ -451,6 +451,7 @@ class Req:
+         session_id: Optional[str] = None,
+         custom_logit_processor: Optional[str] = None,
+         return_hidden_states: bool = False,
++        return_routed_experts: bool = False,
+         eos_token_ids: Optional[Set[int]] = None,
+         bootstrap_host: Optional[str] = None,
+         bootstrap_port: Optional[int] = None,
+@@ -628,6 +629,10 @@ class Req:
+         self.output_topk_p = None
+         self.output_topk_index = None
+ 
++        # capture routed experts
++        self.return_routed_experts = return_routed_experts
++        self.routed_experts = []
++
+         # Embedding (return values)
+         self.embedding = None
+ 
+@@ -943,6 +948,7 @@ class Req:
+         self.retraction_count += 1
+ 
+         self.prefix_indices = torch.empty((0,), dtype=torch.int64)
++        self.routed_experts = []
+         self.last_node = None
+         self.swa_uuid_for_lock = None
+         self.extend_input_len = 0
+@@ -1112,6 +1118,9 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
+     # Whether to return hidden states
+     return_hidden_states: bool = False
+ 
++    # Whether to return captured experts
++    return_routed_experts: bool = False
++
+     # Whether this batch is prefill-only (no token generation needed)
+     is_prefill_only: bool = False
+ 
+@@ -1155,6 +1164,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
+             device=req_to_token_pool.device,
+             spec_algorithm=spec_algorithm,
+             return_hidden_states=any(req.return_hidden_states for req in reqs),
++            return_routed_experts=any(req.return_routed_experts for req in reqs),
+             is_prefill_only=all(req.is_prefill_only for req in reqs),
+             chunked_req=chunked_req,
+         )
+@@ -1900,7 +1910,8 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
+     def __str__(self):
+         return (
+             f"ScheduleBatch(forward_mode={self.forward_mode.name if self.forward_mode else 'None'}, "
+-            f"#req={(len(self.reqs))})"
++            f"#req={(len(self.reqs))}), "
++            f"#out_cache_loc={self.out_cache_loc})"
+         )
+ 
+ 
 diff --git a/python/sglang/srt/managers/scheduler.py b/python/sglang/srt/managers/scheduler.py
-index 655b39a4e..f93907c9c 100644
+index 719e93691..dd9f613da 100644
 --- a/python/sglang/srt/managers/scheduler.py
 +++ b/python/sglang/srt/managers/scheduler.py
-@@ -1671,7 +1671,7 @@ class Scheduler(
+@@ -1250,6 +1250,7 @@ class Scheduler(
+                 input_embeds=recv_req.input_embeds,
+                 custom_logit_processor=recv_req.custom_logit_processor,
+                 return_hidden_states=recv_req.return_hidden_states,
++                return_routed_experts=recv_req.return_routed_experts,
+                 eos_token_ids=self.model_config.hf_eos_token_id,
+                 bootstrap_host=recv_req.bootstrap_host,
+                 bootstrap_port=recv_req.bootstrap_port,
+diff --git a/python/sglang/srt/managers/scheduler_output_processor_mixin.py b/python/sglang/srt/managers/scheduler_output_processor_mixin.py
+index 5f5467c4f..186216c73 100644
+--- a/python/sglang/srt/managers/scheduler_output_processor_mixin.py
++++ b/python/sglang/srt/managers/scheduler_output_processor_mixin.py
+@@ -9,6 +9,7 @@ import torch
+ from sglang.srt.disaggregation.utils import DisaggregationMode
+ from sglang.srt.environ import envs
+ from sglang.srt.layers.logits_processor import LogitsProcessorOutput
++from sglang.srt.layers.moe.routed_experts_capturer import get_global_experts_capturer
+ from sglang.srt.managers.io_struct import (
+     AbortReq,
+     BatchEmbeddingOutput,
+@@ -112,6 +113,14 @@ class SchedulerOutputProcessorMixin:
+                     req.check_finished()
  
-         if memory_leak:
-             msg = "token_to_kv_pool_allocator memory leak detected! " f"{token_msg}"
--            raise ValueError(msg)
-+            # raise ValueError(msg)
+                     if req.finished():
++                        req.routed_experts = (
++                            get_global_experts_capturer().get_routed_experts(
++                                req_pool_idx=req.req_pool_idx,
++                                seqlen=req.seqlen,
++                                req_to_token_pool=self.req_to_token_pool,
++                            )
++                        )
++
+                         release_kv_cache(req, self.tree_cache)
+                         req.time_stats.completion_time = time.perf_counter()
+                     elif not batch.decoding_reqs or req not in batch.decoding_reqs:
+@@ -333,6 +342,12 @@ class SchedulerOutputProcessorMixin:
+             req.check_finished(new_accepted_len)
  
-         if self.disaggregation_mode == DisaggregationMode.DECODE:
-             req_total_size = (
-@@ -1686,7 +1686,7 @@ class Scheduler(
+             if req.finished():
++                req.routed_experts = get_global_experts_capturer().get_routed_experts(
++                    req_pool_idx=req.req_pool_idx,
++                    seqlen=req.seqlen,
++                    req_to_token_pool=self.req_to_token_pool,
++                )
++
+                 if self.server_args.disaggregation_decode_enable_offload_kvcache:
+                     # Asynchronously offload KV cache; release_kv_cache will be called after Device->Host transfer completes
+                     if not self.decode_offload_manager.offload_kv_cache(req):
+@@ -721,6 +736,7 @@ class SchedulerOutputProcessorMixin:
+         spec_accepted_tokens = []
+         retraction_counts = []
+         output_hidden_states = None
++        output_routed_experts = None
+ 
+         queue_times = []
+         forward_entry_times = []
+@@ -925,6 +941,10 @@ class SchedulerOutputProcessorMixin:
+                     if output_hidden_states is None:
+                         output_hidden_states = []
+                     output_hidden_states.append(req.hidden_states)
++                if req.return_routed_experts:
++                    if output_routed_experts is None:
++                        output_routed_experts = []
++                    output_routed_experts.append(req.routed_experts)
+ 
+             if (
+                 req.finished()
+@@ -971,6 +991,7 @@ class SchedulerOutputProcessorMixin:
+                     output_token_ids_logprobs_idx=output_token_ids_logprobs_idx,
+                     output_token_entropy_val=None,
+                     output_hidden_states=output_hidden_states,
++                    output_routed_experts=output_routed_experts,
+                     rids=rids,
+                     http_worker_ipcs=http_worker_ipcs,
+                     placeholder_tokens_idx=None,
+diff --git a/python/sglang/srt/managers/scheduler_runtime_checker_mixin.py b/python/sglang/srt/managers/scheduler_runtime_checker_mixin.py
+index e6f59e5b0..c199b987b 100644
+--- a/python/sglang/srt/managers/scheduler_runtime_checker_mixin.py
++++ b/python/sglang/srt/managers/scheduler_runtime_checker_mixin.py
+@@ -138,7 +138,7 @@ class SchedulerRuntimeCheckerMixin:
                  f"available_size={len(self.req_to_token_pool.free_slots)}, "
                  f"total_size={self.req_to_token_pool.size}\n"
              )
 -            raise ValueError(msg)
 +            # raise ValueError(msg)
  
-         if (
-             self.enable_metrics
-@@ -2233,6 +2233,7 @@ class Scheduler(
-             speculative_num_draft_tokens=self.server_args.speculative_num_draft_tokens,
-             require_mlp_tp_gather=require_mlp_tp_gather(self.server_args),
-             disable_overlap_schedule=self.server_args.disable_overlap_schedule,
-+            offload_tags=self.offload_tags,
-         )
+     def check_memory(self: Scheduler):
+         if self.is_hybrid:
+@@ -150,7 +150,7 @@ class SchedulerRuntimeCheckerMixin:
  
-     @staticmethod
-@@ -2247,6 +2248,7 @@ class Scheduler(
-         speculative_num_draft_tokens,
-         require_mlp_tp_gather: bool,
-         disable_overlap_schedule: bool,
-+        offload_tags: set[str],
-     ):
-         # Check if other DP workers have running batches
-         if local_batch is None:
-@@ -2277,7 +2279,7 @@ class Scheduler(
-         )
+         if memory_leak:
+             msg = "token_to_kv_pool_allocator memory leak detected! " f"{token_msg}"
+-            raise ValueError(msg)
++            # raise ValueError(msg)
  
-         tbo_preparer = TboDPAttentionPreparer()
--        if disable_overlap_schedule:
-+        if len(offload_tags) == 0 and disable_overlap_schedule:
-             group = tp_group.device_group
-             device = tp_group.device
-         else:
-diff --git a/python/sglang/srt/managers/tokenizer_communicator_mixin.py b/python/sglang/srt/managers/tokenizer_communicator_mixin.py
-index cc929e5a7..5cba9b335 100644
---- a/python/sglang/srt/managers/tokenizer_communicator_mixin.py
-+++ b/python/sglang/srt/managers/tokenizer_communicator_mixin.py
-@@ -355,11 +355,15 @@ class TokenizerCommunicatorMixin:
-         request: Optional[fastapi.Request] = None,
-     ) -> Tuple[bool, str]:
-         self.auto_create_handle_loop()
--        assert (
--            self.server_args.dp_size == 1
--        ), "dp_size must be 1 for init parameter update group"
--        result = (await self.init_weights_update_group_communicator(obj))[0]
--        return result.success, result.message
-+        results = await self.init_weights_update_group_communicator(obj)
-+        if self.server_args.dp_size == 1:
-+            result = results[0]
-+            return result.success, result.message
+         self._check_req_pool()
+ 
+diff --git a/python/sglang/srt/managers/scheduler_update_weights_mixin.py b/python/sglang/srt/managers/scheduler_update_weights_mixin.py
+index 9bed7030d..f83b7e736 100644
+--- a/python/sglang/srt/managers/scheduler_update_weights_mixin.py
++++ b/python/sglang/srt/managers/scheduler_update_weights_mixin.py
+@@ -76,7 +76,10 @@ class SchedulerUpdateWeightsMixin:
+ 
+     def update_weights_from_tensor(self, recv_req: UpdateWeightsFromTensorReqInput):
+         """Update the online model parameter from tensors."""
+-        success, message = self.tp_worker.update_weights_from_tensor(recv_req)
++        if self.draft_worker is not None:
++            success, message = self.draft_worker.update_weights_from_tensor(recv_req)
 +        else:
-+            all_success = all([r.success for r in results])
-+            all_message = [r.message for r in results]
-+            all_message = " | ".join(all_message)
-+            return all_success, all_message
- 
-     async def destroy_weights_update_group(
-         self,
-@@ -367,11 +371,15 @@ class TokenizerCommunicatorMixin:
-         request: Optional[fastapi.Request] = None,
-     ) -> Tuple[bool, str]:
-         self.auto_create_handle_loop()
--        assert (
--            self.server_args.dp_size == 1
--        ), "dp_size must be 1 for destroy parameter update group"
--        result = (await self.destroy_weights_update_group_communicator(obj))[0]
--        return result.success, result.message
-+        results = await self.destroy_weights_update_group_communicator(obj)
-+        if self.server_args.dp_size == 1:
-+            result = results[0]
-+            return result.success, result.message
-+        else:
-+            all_success = all([r.success for r in results])
-+            all_message = [r.message for r in results]
-+            all_message = " | ".join(all_message)
-+            return all_success, all_message
- 
-     async def update_weights_from_distributed(
-         self: TokenizerManager,
-@@ -379,9 +387,6 @@ class TokenizerCommunicatorMixin:
-         request: Optional[fastapi.Request] = None,
-     ) -> Tuple[bool, str]:
-         self.auto_create_handle_loop()
--        assert (
--            self.server_args.dp_size == 1 or self.server_args.enable_dp_attention
--        ), "dp_size must be 1 or dp attention must be enabled for update weights from distributed"
- 
-         if obj.abort_all_requests:
-             self.abort_request(abort_all=True)
-@@ -389,8 +394,15 @@ class TokenizerCommunicatorMixin:
-         # This means that weight sync
-         # cannot run while requests are in progress.
-         async with self.model_update_lock.writer_lock:
--            result = (await self.update_weights_from_distributed_communicator(obj))[0]
--            return result.success, result.message
-+            results = await self.update_weights_from_distributed_communicator(obj)
-+            if self.server_args.dp_size == 1:
-+                result = results[0]
-+                return result.success, result.message
-+            else:
-+                all_success = all([r.success for r in results])
-+                all_message = [r.message for r in results]
-+                all_message = " | ".join(all_message)
-+                return all_success, all_message
- 
-     async def init_weights_send_group_for_remote_instance(
-         self,
++            success, message = self.tp_worker.update_weights_from_tensor(recv_req)
+         # TODO extract common code b/t update_weights_from_distributed and update_weights_from_tensor later
+         if success:
+             if recv_req.flush_cache:
 diff --git a/python/sglang/srt/managers/tokenizer_manager.py b/python/sglang/srt/managers/tokenizer_manager.py
-index 9d6bf9fc5..cbdeca0ec 100644
+index c5a2e35ed..403cfcd9b 100644
 --- a/python/sglang/srt/managers/tokenizer_manager.py
 +++ b/python/sglang/srt/managers/tokenizer_manager.py
-@@ -1052,6 +1052,9 @@ class TokenizerManager(TokenizerCommunicatorMixin):
+@@ -802,6 +802,7 @@ class TokenizerManager(TokenizerCommunicatorMixin):
+                 session_params=session_params,
+                 custom_logit_processor=obj.custom_logit_processor,
+                 return_hidden_states=obj.return_hidden_states,
++                return_routed_experts=obj.return_routed_experts,
+                 data_parallel_rank=obj.data_parallel_rank,
+                 priority=obj.priority,
+                 extra_key=obj.extra_key,
+@@ -1169,6 +1170,9 @@ class TokenizerManager(TokenizerCommunicatorMixin):
          async with self.is_pause_cond:
              self.is_pause = True
              self.abort_request(abort_all=True)
@@ -148,7 +586,17 @@ index 9d6bf9fc5..cbdeca0ec 100644
  
      async def continue_generation(self):
          async with self.is_pause_cond:
-@@ -1430,12 +1433,13 @@ class TokenizerManager(TokenizerCommunicatorMixin):
+@@ -1490,6 +1494,9 @@ class TokenizerManager(TokenizerCommunicatorMixin):
+             if getattr(recv_obj, "output_hidden_states", None):
+                 meta_info["hidden_states"] = recv_obj.output_hidden_states[i]
+ 
++            if getattr(recv_obj, "output_routed_experts", None):
++                meta_info["routed_experts"] = recv_obj.output_routed_experts[i]
++
+             if isinstance(recv_obj, BatchStrOutput):
+                 state.text += recv_obj.output_strs[i]
+                 if state.obj.stream:
+@@ -1616,12 +1623,13 @@ class TokenizerManager(TokenizerCommunicatorMixin):
              return
  
          if len(recv_obj.input_token_logprobs_val) > 0:
@@ -168,311 +616,383 @@ index 9d6bf9fc5..cbdeca0ec 100644
          state.output_token_logprobs_val.extend(
              recv_obj.output_token_logprobs_val[recv_obj_index]
          )
-@@ -1647,14 +1651,24 @@ class TokenizerManager(TokenizerCommunicatorMixin):
-         state.finished = True
-         if recv_obj.finished_reason:
-             out = {
-+                "text": "",
-+                "output_ids": [],
-                 "meta_info": {
-                     "id": recv_obj.rid,
-                     "finish_reason": recv_obj.finished_reason,
-+                    "prompt_tokens": 0,
-+                    "completion_tokens": 0,
-+                    "model_version": self.server_args.weight_version,
-+                    "cached_tokens": 0,
-+                    "e2e_latency": 0,
-+                    "output_token_logprobs": [[]],
-+                    "input_token_logprobs": [[]],
-                 },
-             }
-         else:
-             out = {
-                 "text": "",
-+                "output_ids": [],
-                 "meta_info": {
-                     "id": origin_rid,
-                     "finish_reason": {
-@@ -1663,6 +1677,11 @@ class TokenizerManager(TokenizerCommunicatorMixin):
-                     },
-                     "prompt_tokens": 0,
-                     "completion_tokens": 0,
-+                    "model_version": self.server_args.weight_version,
-+                    "cached_tokens": 0,
-+                    "e2e_latency": 0,
-+                    "output_token_logprobs": [[]],
-+                    "input_token_logprobs": [[]],
-                 },
-             }
-         state.out_list.append(out)
+@@ -1739,6 +1747,9 @@ class TokenizerManager(TokenizerCommunicatorMixin):
+                 meta_info["spec_accept_length"] = (
+                     recv_obj.completion_tokens[i] / recv_obj.spec_verify_ct[i]
+                 )
++                meta_info["spec_accept_token_num"] = accepted_tokens
++                meta_info["spec_draft_token_num"] = total_draft_tokens
++                meta_info["spec_verify_ct"] = recv_obj.spec_verify_ct[i]
+ 
+     def _calculate_timing_metrics(
+         self,
 diff --git a/python/sglang/srt/mem_cache/memory_pool.py b/python/sglang/srt/mem_cache/memory_pool.py
-index eb863f4c8..9b83cc093 100644
+index 739e28943..af3c78144 100644
 --- a/python/sglang/srt/mem_cache/memory_pool.py
 +++ b/python/sglang/srt/mem_cache/memory_pool.py
-@@ -747,6 +747,7 @@ class HybridLinearKVPool(KVCache):
-         full_attention_layer_ids: List[int],
+@@ -848,6 +848,7 @@ class HybridLinearKVPool(KVCache):
          enable_kvcache_transpose: bool,
          device: str,
+         mamba_pool: MambaPool,
 +        enable_memory_saver: bool,
-     ):
-         self.size = size
-         self.dtype = dtype
-@@ -767,7 +768,7 @@ class HybridLinearKVPool(KVCache):
-             head_dim=head_dim,
-             layer_num=self.full_layer_nums,
-             device=device,
--            enable_memory_saver=False,
-+            enable_memory_saver=enable_memory_saver,
-         )
+         # TODO: refactor mla related args
+         use_mla: bool = False,
+         kv_lora_rank: int = None,
+@@ -879,7 +880,7 @@ class HybridLinearKVPool(KVCache):
+                 head_dim=head_dim,
+                 layer_num=self.full_layer_nums,
+                 device=device,
+-                enable_memory_saver=False,
++                enable_memory_saver=enable_memory_saver,
+             )
+         else:
+             TokenToKVPoolClass = MLATokenToKVPool
+@@ -891,7 +892,7 @@ class HybridLinearKVPool(KVCache):
+                 device=device,
+                 kv_lora_rank=kv_lora_rank,
+                 qk_rope_head_dim=qk_rope_head_dim,
+-                enable_memory_saver=False,
++                enable_memory_saver=enable_memory_saver,
+             )
          self.full_attention_layer_id_mapping = {
              id: i for i, id in enumerate(full_attention_layer_ids)
-diff --git a/python/sglang/srt/model_executor/cuda_graph_runner.py b/python/sglang/srt/model_executor/cuda_graph_runner.py
-index 8bfb077f9..9f067cac8 100644
---- a/python/sglang/srt/model_executor/cuda_graph_runner.py
-+++ b/python/sglang/srt/model_executor/cuda_graph_runner.py
-@@ -49,6 +49,11 @@ from sglang.srt.model_executor.forward_batch_info import (
-     enable_num_token_non_padded,
- )
- from sglang.srt.two_batch_overlap import TboCudaGraphRunnerPlugin
-+from sglang.srt.layers.moe.utils import (
-+    get_deepep_mode,
-+    get_moe_a2a_backend,
-+)
-+from sglang.srt.layers.moe.token_dispatcher.deepep import DeepEPBuffer
- from sglang.srt.utils import (
-     empty_context,
-     get_available_gpu_memory,
-@@ -237,6 +242,8 @@ class CudaGraphRunner:
-         self.tp_size = model_runner.server_args.tp_size
-         self.dp_size = model_runner.server_args.dp_size
-         self.pp_size = model_runner.server_args.pp_size
-+        # Record DeepEP mode used during capture to ensure replay consistency
-+        self._captured_deepep_mode = None
- 
-         self.attn_tp_size = get_attention_tp_size()
-         self.attn_tp_rank = get_attention_tp_rank()
-@@ -655,6 +662,16 @@ class CudaGraphRunner:
-             )
-             return logits_output_or_pp_proxy_tensors
- 
-+        # Resolve and pin DeepEP mode to avoid AUTO flipping between capture and replay
-+        if get_moe_a2a_backend().is_deepep():
-+            # Base runner handles decode/verify; not extend-in-batch
-+            resolved = get_deepep_mode().resolve(is_extend_in_batch=False)
-+            if resolved.is_low_latency():
-+                DeepEPBuffer.set_dispatch_mode_as_low_latency()
-+            else:
-+                DeepEPBuffer.set_dispatch_mode_as_normal()
-+            self._captured_deepep_mode = resolved
-+
-         for _ in range(2):
-             self.device_module.synchronize()
-             self.model_runner.tp_group.barrier()
-@@ -797,6 +814,16 @@ class CudaGraphRunner:
-         skip_attn_backend_init: bool = False,
-         pp_proxy_tensors: Optional[PPProxyTensors] = None,
-     ) -> Union[LogitsProcessorOutput, PPProxyTensors]:
-+        # Re-apply captured DeepEP mode before replay to keep CUDA Graph stable under AUTO
-+        if (
-+            get_moe_a2a_backend().is_deepep()
-+            and self._captured_deepep_mode is not None
-+        ):
-+            if self._captured_deepep_mode.is_low_latency():
-+                DeepEPBuffer.set_dispatch_mode_as_low_latency()
-+            else:
-+                DeepEPBuffer.set_dispatch_mode_as_normal()
-+
-         if not skip_attn_backend_init:
-             self.replay_prepare(forward_batch, pp_proxy_tensors)
-         else:
 diff --git a/python/sglang/srt/model_executor/model_runner.py b/python/sglang/srt/model_executor/model_runner.py
-index a74f85d71..6a49f6a73 100644
+index 19e029d60..8c1be2535 100644
 --- a/python/sglang/srt/model_executor/model_runner.py
 +++ b/python/sglang/srt/model_executor/model_runner.py
-@@ -23,6 +23,7 @@ import socket
- import threading
- import time
- from collections import defaultdict
-+from contextlib import nullcontext
- from dataclasses import dataclass
- from typing import List, Optional, Tuple, Union
+@@ -86,6 +86,10 @@ from sglang.srt.layers.dp_attention import (
+     initialize_dp_attention,
+ )
+ from sglang.srt.layers.logits_processor import LogitsProcessorOutput
++from sglang.srt.layers.moe.routed_experts_capturer import (
++    RoutedExpertsCapturer,
++    set_global_experts_capturer,
++)
+ from sglang.srt.layers.sampler import Sampler
+ from sglang.srt.layers.torchao_utils import apply_torchao_config_to_model
+ from sglang.srt.lora.lora_manager import LoRAManager
+@@ -155,6 +159,7 @@ from sglang.srt.utils.offloader import (
+     set_offloader,
+ )
+ from sglang.srt.utils.patch_torch import monkey_patch_torch_reductions
++from sglang.srt.layers.moe.routed_experts_capturer import get_global_experts_capturer
+ from sglang.srt.utils.torch_memory_saver_adapter import TorchMemorySaverAdapter
+ from sglang.srt.weight_sync.tensor_bucket import (
+     FlattenedTensorBucket,
+@@ -484,6 +489,10 @@ class ModelRunner:
+             server_args.max_running_requests,
+             server_args.max_total_tokens,
+         )
++
++        # Init routed experts capturer
++        self.init_routed_experts_capturer()
++
+         if self.device == "cuda":
+             self.init_cublas()
+             self.init_attention_backend()
+@@ -519,6 +528,31 @@ class ModelRunner:
  
-@@ -788,7 +789,7 @@ class ModelRunner:
+             self.model.set_eagle3_layers_to_capture(eagle_aux_hidden_state_layer_ids)
+ 
++    def init_routed_experts_capturer(self):
++        # TODO: the redundant logic with TpModelWorker
++        max_running_requests = min(
++            (
++                self.max_total_num_tokens // 2
++                if self.server_args.max_running_requests is None
++                else self.server_args.max_running_requests
++                // (
++                    self.server_args.dp_size
++                    if self.server_args.enable_dp_attention
++                    else 1
++                )
++            ),
++            self.req_to_token_pool.size,
++        )
++        set_global_experts_capturer(
++            RoutedExpertsCapturer.create(
++                enable=get_global_server_args().enable_return_routed_experts,
++                model_config=self.model_config,
++                num_tokens=self.max_total_num_tokens + self.page_size,
++                max_running_requests=max_running_requests,
++                device=self.device,
++            )
++        )
++
+     def model_specific_adjustment(self):
+         server_args = self.server_args
+ 
+@@ -758,7 +792,11 @@ class ModelRunner:
+ 
          with self.memory_saver_adapter.region(
              GPU_MEMORY_TYPE_WEIGHTS,
-             enable_cpu_backup=self.server_args.enable_weights_cpu_backup,
--        ):
-+        ) if not self.is_draft_worker else nullcontext():
+-            enable_cpu_backup=self.server_args.enable_weights_cpu_backup,
++            enable_cpu_backup=(
++                self.server_args.enable_weights_cpu_backup
++                if not self.is_draft_worker
++                else True
++            ),
+         ):
              self.model = get_model(
                  model_config=self.model_config,
-                 load_config=self.load_config,
-@@ -1667,6 +1668,7 @@ class ModelRunner:
-                     ),
+@@ -1810,6 +1848,7 @@ class ModelRunner:
                      enable_kvcache_transpose=False,
                      device=self.device,
+                     mamba_pool=self.req_to_token_pool.mamba_pool,
 +                    enable_memory_saver=self.server_args.enable_memory_saver,
+                     use_mla=self.use_mla_backend,
+                     **extra_args,
                  )
-             else:
-                 self.token_to_kv_pool = MHATokenToKVPool(
+@@ -2164,6 +2203,10 @@ class ModelRunner:
+                 reinit_attn_backend,
+                 split_forward_count,
+             )
++            # Copy cached routing experts' buffers back to CPU cache
++            get_global_experts_capturer().sync_fwd_experts_buffer_DtoH(
++                forward_batch.out_cache_loc
++            )
+ 
+         if self.eplb_manager is not None:
+             self.eplb_manager.on_forward_pass_end()
+diff --git a/python/sglang/srt/models/deepseek_v2.py b/python/sglang/srt/models/deepseek_v2.py
+index 895b69105..4209a3ea6 100644
+--- a/python/sglang/srt/models/deepseek_v2.py
++++ b/python/sglang/srt/models/deepseek_v2.py
+@@ -641,6 +641,7 @@ class DeepseekV2MoE(nn.Module):
+ 
+         self.topk = TopK(
+             top_k=config.num_experts_per_tok + self.num_fused_shared_experts,
++            layer_id=self.layer_id,
+             renormalize=config.norm_topk_prob,
+             use_grouped_topk=True,
+             num_expert_group=config.n_group,
+diff --git a/python/sglang/srt/models/ernie4.py b/python/sglang/srt/models/ernie4.py
+index ab1b6576b..dffd8f09a 100644
+--- a/python/sglang/srt/models/ernie4.py
++++ b/python/sglang/srt/models/ernie4.py
+@@ -87,6 +87,7 @@ class Ernie4Moe(nn.Module):
+ 
+         self.topk = TopK(
+             top_k=config.moe_k,
++            layer_id=layer_id,
+             renormalize=True,
+             use_grouped_topk=False,
+             correction_bias=self.gate.e_score_correction_bias,
 diff --git a/python/sglang/srt/models/glm4_moe.py b/python/sglang/srt/models/glm4_moe.py
-index d4cc9e1e6..66bd04973 100644
+index 3b04422b1..3b810843e 100644
 --- a/python/sglang/srt/models/glm4_moe.py
 +++ b/python/sglang/srt/models/glm4_moe.py
-@@ -664,7 +664,7 @@ class Glm4MoeDecoderLayer(DeepseekV2DecoderLayer):
-             layer_scatter_modes=self.layer_scatter_modes,
-             input_layernorm=self.input_layernorm,
-             post_attention_layernorm=self.post_attention_layernorm,
--            allow_reduce_scatter=True,
-+            allow_reduce_scatter=False,
+@@ -374,6 +374,7 @@ class Glm4MoeSparseMoeBlock(nn.Module):
+ 
+         self.topk = TopK(
+             top_k=self.top_k,
++            layer_id=self.layer_id,
+             renormalize=config.norm_topk_prob,
+             use_grouped_topk=True,
+             num_expert_group=config.n_group,
+diff --git a/python/sglang/srt/models/gpt_oss.py b/python/sglang/srt/models/gpt_oss.py
+index 9474700c4..398d622ff 100644
+--- a/python/sglang/srt/models/gpt_oss.py
++++ b/python/sglang/srt/models/gpt_oss.py
+@@ -113,6 +113,7 @@ class GptOssSparseMoeBlock(nn.Module):
+         self.topk = TopK(
+             top_k=config.num_experts_per_tok,
+             renormalize=True,
++            layer_id=layer_id,
          )
  
-     def forward(
-@@ -1079,5 +1079,4 @@ class Glm4MoeForCausalLM(DeepseekV2ForCausalLM):
-                         )
-                         weight_loader(param, loaded_weight)
- 
--
- EntryClass = [Glm4MoeForCausalLM]
-diff --git a/python/sglang/srt/speculative/eagle_draft_cuda_graph_runner.py b/python/sglang/srt/speculative/eagle_draft_cuda_graph_runner.py
-index a6d5582c3..bff02dc13 100644
---- a/python/sglang/srt/speculative/eagle_draft_cuda_graph_runner.py
-+++ b/python/sglang/srt/speculative/eagle_draft_cuda_graph_runner.py
-@@ -27,6 +27,11 @@ from sglang.srt.utils import (
-     require_mlp_sync,
-     require_mlp_tp_gather,
- )
-+from sglang.srt.layers.moe.utils import (
-+    get_deepep_mode,
-+    get_moe_a2a_backend,
-+)
-+from sglang.srt.layers.moe.token_dispatcher.deepep import DeepEPBuffer
- 
- if TYPE_CHECKING:
-     from sglang.srt.speculative.eagle_worker import EAGLEWorker
-@@ -58,6 +63,8 @@ class EAGLEDraftCudaGraphRunner:
-         self.enable_profile_cuda_graph = (
-             model_runner.server_args.enable_profile_cuda_graph
+         self.top_k = config.num_experts_per_tok
+diff --git a/python/sglang/srt/models/grok.py b/python/sglang/srt/models/grok.py
+index 1f4a3b443..4eb23cca8 100644
+--- a/python/sglang/srt/models/grok.py
++++ b/python/sglang/srt/models/grok.py
+@@ -167,6 +167,7 @@ class Grok1MoE(nn.Module):
+         self.topk = TopK(
+             top_k=top_k,
+             renormalize=False,
++            layer_id=layer_id,
+             custom_routing_function=custom_routing_function,
          )
-+        # Record the resolved DeepEP mode used during capture to ensure replay consistency
-+        self._captured_deepep_mode = None
-         server_args = model_runner.server_args
  
-         # Batch sizes to capture
-@@ -261,6 +268,15 @@ class EAGLEDraftCudaGraphRunner:
-             forward_batch.spec_info.hidden_states = hidden_states_backup
-             return ret
+diff --git a/python/sglang/srt/models/hunyuan.py b/python/sglang/srt/models/hunyuan.py
+index 7c6fd9e48..b20d28544 100644
+--- a/python/sglang/srt/models/hunyuan.py
++++ b/python/sglang/srt/models/hunyuan.py
+@@ -150,6 +150,7 @@ class HunYuanSparseMoeBlock(nn.Module):
  
-+        # Resolve and pin DeepEP mode to avoid AUTO flipping between runs
-+        if get_moe_a2a_backend().is_deepep():
-+            resolved = get_deepep_mode().resolve(is_extend_in_batch=False)
-+            if resolved.is_low_latency():
-+                DeepEPBuffer.set_dispatch_mode_as_low_latency()
-+            else:
-+                DeepEPBuffer.set_dispatch_mode_as_normal()
-+            self._captured_deepep_mode = resolved
-+
-         for _ in range(2):
-             torch.cuda.synchronize()
-             self.model_runner.tp_group.barrier()
-@@ -287,6 +303,13 @@ class EAGLEDraftCudaGraphRunner:
-         raw_bs = forward_batch.batch_size
-         raw_num_token = raw_bs * self.num_tokens_per_bs
- 
-+        # Re-pin DeepEP mode to the one captured to avoid AUTO switching
-+        if get_moe_a2a_backend().is_deepep() and self._captured_deepep_mode is not None:
-+            if self._captured_deepep_mode.is_low_latency():
-+                DeepEPBuffer.set_dispatch_mode_as_low_latency()
-+            else:
-+                DeepEPBuffer.set_dispatch_mode_as_normal()
-+
-         # Pad
-         if self.require_mlp_tp_gather:
-             max_num_tokens = max(forward_batch.global_num_tokens_cpu)
-diff --git a/python/sglang/srt/speculative/eagle_draft_extend_cuda_graph_runner.py b/python/sglang/srt/speculative/eagle_draft_extend_cuda_graph_runner.py
-index 72f182ed9..849f4e3f0 100644
---- a/python/sglang/srt/speculative/eagle_draft_extend_cuda_graph_runner.py
-+++ b/python/sglang/srt/speculative/eagle_draft_extend_cuda_graph_runner.py
-@@ -29,6 +29,11 @@ from sglang.srt.utils import (
-     require_mlp_sync,
-     require_mlp_tp_gather,
- )
-+from sglang.srt.layers.moe.utils import (
-+    get_deepep_mode,
-+    get_moe_a2a_backend,
-+)
-+from sglang.srt.layers.moe.token_dispatcher.deepep import DeepEPBuffer
- 
- if TYPE_CHECKING:
-     from sglang.srt.speculative.eagle_worker import EAGLEWorker
-@@ -56,6 +61,8 @@ class EAGLEDraftExtendCudaGraphRunner:
+         self.topk = TopK(
+             top_k=top_k,
++            layer_id=layer_id,
+             renormalize=True if top_k > 1 else False,
          )
-         self.capture_bs, self.compile_bs = get_batch_sizes_to_capture(model_runner)
-         self.padded_static_len = -1
-+        # Record resolved DeepEP mode used during capture to ensure replay consistency
-+        self._captured_deepep_mode = None
  
-         # Attention backend
-         self.num_tokens_per_bs = self.speculative_num_steps + 1
-@@ -238,6 +245,15 @@ class EAGLEDraftExtendCudaGraphRunner:
+diff --git a/python/sglang/srt/models/longcat_flash.py b/python/sglang/srt/models/longcat_flash.py
+index 84aeb8b30..19637b20c 100644
+--- a/python/sglang/srt/models/longcat_flash.py
++++ b/python/sglang/srt/models/longcat_flash.py
+@@ -241,6 +241,7 @@ class LongcatFlashMoE(nn.Module):
+             renormalize=False,
+             use_grouped_topk=False,
+             correction_bias=self.router.e_score_correction_bias.data,
++            layer_id=layer_id,
          )
-         spec_info.positions = None
+         self.topk.forward = self.topk.forward_native
  
-+        # Resolve and pin DeepEP mode during capture to avoid AUTO flipping between runs
-+        if get_moe_a2a_backend().is_deepep():
-+            resolved = get_deepep_mode().resolve(is_extend_in_batch=True)
-+            if resolved.is_low_latency():
-+                DeepEPBuffer.set_dispatch_mode_as_low_latency()
-+            else:
-+                DeepEPBuffer.set_dispatch_mode_as_normal()
-+            self._captured_deepep_mode = resolved
-+
-         # Forward batch
-         forward_batch = ForwardBatch(
-             forward_mode=ForwardMode.DRAFT_EXTEND,
-@@ -313,6 +329,13 @@ class EAGLEDraftExtendCudaGraphRunner:
+diff --git a/python/sglang/srt/models/qwen2_moe.py b/python/sglang/srt/models/qwen2_moe.py
+index 051095e61..4857b775e 100644
+--- a/python/sglang/srt/models/qwen2_moe.py
++++ b/python/sglang/srt/models/qwen2_moe.py
+@@ -151,6 +151,7 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
+         self.topk = TopK(
+             top_k=config.num_experts_per_tok,
+             renormalize=config.norm_topk_prob,
++            layer_id=layer_id,
+         )
  
-     def replay(self, forward_batch: ForwardBatch):
-         assert forward_batch.out_cache_loc is not None
-+        # Re-pin DeepEP mode to captured one to avoid AUTO switching between runs
-+        if get_moe_a2a_backend().is_deepep() and self._captured_deepep_mode is not None:
-+            if self._captured_deepep_mode.is_low_latency():
-+                DeepEPBuffer.set_dispatch_mode_as_low_latency()
-+            else:
-+                DeepEPBuffer.set_dispatch_mode_as_normal()
-+
-         # batch_size and num_seqs can be different in case there are finished examples
-         # in the batch, which will not be counted as num_seqs
-         raw_bs = forward_batch.batch_size
+         self.experts = get_moe_impl_class(quant_config)(
+diff --git a/python/sglang/srt/models/qwen3_moe.py b/python/sglang/srt/models/qwen3_moe.py
+index d3acc629b..5aaae8523 100644
+--- a/python/sglang/srt/models/qwen3_moe.py
++++ b/python/sglang/srt/models/qwen3_moe.py
+@@ -100,6 +100,7 @@ class Qwen3MoeSparseMoeBlock(nn.Module):
+             top_k=config.num_experts_per_tok,
+             renormalize=config.norm_topk_prob,
+             use_grouped_topk=False,
++            layer_id=layer_id,
+         )
+ 
+         self.experts = get_moe_impl_class(quant_config)(
+diff --git a/python/sglang/srt/models/step3_vl.py b/python/sglang/srt/models/step3_vl.py
+index 5a9e74ab6..07a06351f 100644
+--- a/python/sglang/srt/models/step3_vl.py
++++ b/python/sglang/srt/models/step3_vl.py
+@@ -129,6 +129,7 @@ class Step3TextMoEMLP(nn.Module):
+             top_k=config.moe_top_k,
+             renormalize=config.norm_expert_weight,
+             use_grouped_topk=False,
++            layer_id=layer_id,
+         )
+ 
+         self.experts = get_moe_impl_class(quant_config)(
+diff --git a/python/sglang/srt/server_args.py b/python/sglang/srt/server_args.py
+index 5b9a520b9..da24facf4 100644
+--- a/python/sglang/srt/server_args.py
++++ b/python/sglang/srt/server_args.py
+@@ -515,6 +515,7 @@ class ServerArgs:
+     disable_fast_image_processor: bool = False
+     keep_mm_feature_on_device: bool = False
+     enable_return_hidden_states: bool = False
++    enable_return_routed_experts: bool = False
+     scheduler_recv_interval: int = 1
+     numa_node: Optional[List[int]] = None
+     enable_deterministic_inference: bool = False
+@@ -3384,6 +3385,11 @@ class ServerArgs:
+             action="store_true",
+             help="Enable returning hidden states with responses.",
+         )
++        parser.add_argument(
++            "--enable-return-routed-experts",
++            action="store_true",
++            help="Enable returning routed experts of each layer with responses.",
++        )
+         parser.add_argument(
+             "--scheduler-recv-interval",
+             type=int,
 diff --git a/python/sglang/srt/speculative/eagle_info.py b/python/sglang/srt/speculative/eagle_info.py
-index 5d8c920c4..bccf57fb9 100644
+index a2d72dc48..c18f37f1c 100644
 --- a/python/sglang/srt/speculative/eagle_info.py
 +++ b/python/sglang/srt/speculative/eagle_info.py
-@@ -709,6 +709,10 @@ class EagleDraftInput(SpecInput):
+@@ -750,6 +750,10 @@ class EagleDraftInput(SpecInput, EagleDraftInputV2Mixin):
              self.topk_index = self.topk_index[: len(new_indices)]
              self.hidden_states = self.hidden_states[: len(new_indices)]
              self.verified_id = self.verified_id[: len(new_indices)]
 +            if self.accept_length is not None:
 +                self.accept_length = self.accept_length[: len(new_indices)]
 +            if self.accept_length_cpu is not None:
-+                self.accept_length_cpu = self.accept_length_cpu[:len(new_indices)]
++                self.accept_length_cpu = self.accept_length_cpu[: len(new_indices)]
          else:
              # in some cases(e.g draft_extend), we have not filtered the batch by `unfinished_index`
              self.topk_p = self.topk_p[new_indices]
-@@ -731,6 +735,17 @@ class EagleDraftInput(SpecInput):
+@@ -784,6 +788,27 @@ class EagleDraftInput(SpecInput, EagleDraftInputV2Mixin):
          self.verified_id = torch.cat([self.verified_id, spec_info.verified_id], axis=0)
          self.topk_p = torch.cat([self.topk_p, spec_info.topk_p])
          self.topk_index = torch.cat([self.topk_index, spec_info.topk_index])
 +        if self.accept_length is not None and spec_info.accept_length is not None:
-+            self.accept_length = torch.cat([self.accept_length, spec_info.accept_length])
++            self.accept_length = torch.cat(
++                [self.accept_length, spec_info.accept_length]
++            )
 +            self.accept_length_cpu = self.accept_length.tolist()
 +        elif self.accept_length is not None:
-+            zeros = torch.zeros([spec_info.verified_id.shape[0]],dtype=self.accept_length.dtype,device=self.accept_length.device)
++            zeros = torch.zeros(
++                [spec_info.verified_id.shape[0]],
++                dtype=self.accept_length.dtype,
++                device=self.accept_length.device,
++            )
 +            self.accept_length = torch.cat([self.accept_length, zeros])
 +            self.accept_length_cpu = self.accept_length.tolist()
 +        elif spec_info.accept_length is not None:
-+            zeros = torch.zeros([self.verified_id.shape[0]],dtype=self.accept_length.dtype,device=self.accept_length.device)
++            zeros = torch.zeros(
++                [self.verified_id.shape[0]],
++                dtype=self.accept_length.dtype,
++                device=self.accept_length.device,
++            )
 +            self.accept_length = torch.cat([zeros, spec_info.accept_length])
 +            self.accept_length_cpu = self.accept_length.tolist()
  
  
  @dataclass
+diff --git a/python/sglang/srt/speculative/eagle_worker.py b/python/sglang/srt/speculative/eagle_worker.py
+index 08e6516bc..37b4c3f85 100644
+--- a/python/sglang/srt/speculative/eagle_worker.py
++++ b/python/sglang/srt/speculative/eagle_worker.py
+@@ -9,6 +9,7 @@ from sglang.srt.layers.dp_attention import get_attention_tp_group
+ from sglang.srt.layers.logits_processor import LogitsProcessorOutput
+ from sglang.srt.layers.moe.utils import speculative_moe_backend_context
+ from sglang.srt.layers.sampler import get_token_ids_logprobs, get_top_logprobs
++from sglang.srt.managers.io_struct import UpdateWeightsFromTensorReqInput
+ from sglang.srt.managers.schedule_batch import ScheduleBatch
+ from sglang.srt.managers.scheduler import GenerationBatchResult
+ from sglang.srt.managers.tp_worker import TpModelWorker
+@@ -50,6 +51,7 @@ from sglang.srt.speculative.spec_utils import (
+     select_top_k_tokens,
+ )
+ from sglang.srt.utils import (
++    MultiprocessingSerializer,
+     empty_context,
+     get_available_gpu_memory,
+     get_bool_env_var,
+@@ -57,6 +59,7 @@ from sglang.srt.utils import (
+     is_npu,
+     next_power_of_2,
+ )
++from sglang.srt.utils.patch_torch import monkey_patch_torch_reductions
+ 
+ _is_npu = is_npu()
+ 
+@@ -984,6 +987,26 @@ class EAGLEWorker(TpModelWorker):
+         draft_input.topk_p, draft_input.topk_index = fast_topk(probs, self.topk, dim=-1)
+         draft_input.hidden_states = logits_output.hidden_states
+ 
++    def update_weights_from_tensor(self, recv_req: UpdateWeightsFromTensorReqInput):
++
++        monkey_patch_torch_reductions()
++        named_tensors = MultiprocessingSerializer.deserialize(
++            recv_req.serialized_named_tensors[self.tp_rank]
++        )
++        success, message = self.model_runner.update_weights_from_tensor(
++            named_tensors=named_tensors,
++            load_format=recv_req.load_format,
++        )
++        if not success:
++            return success, message
++
++        success, message = self.target_worker.model_runner.update_weights_from_tensor(
++            named_tensors=named_tensors,
++            load_format=recv_req.load_format,
++        )
++
++        return success, message
++
+ 
+ @torch.compile(dynamic=True, disable=_is_npu)
+ def get_last_loc_large_page_size_top_k_1(
