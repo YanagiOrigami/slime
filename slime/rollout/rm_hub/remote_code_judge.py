@@ -144,14 +144,6 @@ def _extract_code(response: str) -> tuple[str, str]:
     # 查找所有代码块（按出现顺序）
     code_blocks = []
     
-    # 匹配带语言标识的代码块
-    pattern_with_lang = r"```([^\s`\n]+)[ \t]*\r?\n?([\s\S]*?)\r?\n?```"
-    matches = re.finditer(pattern_with_lang, response, re.DOTALL)
-    for match in matches:
-        lang = match.group(1).lower()
-        code = match.group(2).strip()
-        code_blocks.append((code, lang))
-    
     # 匹配无语言标识的代码块
     pattern_no_lang = r"```(?![A-Za-z])[\t ]*\r?\n?([\s\S]*?)\r?\n?```"
     matches = re.finditer(pattern_no_lang, response, re.DOTALL)
@@ -159,6 +151,15 @@ def _extract_code(response: str) -> tuple[str, str]:
         code = match.group(1).strip()
         # 通过代码内容推断语言
         lang = _detect_language(code)
+        code_blocks.append((code, lang))
+
+
+    # 匹配带语言标识的代码块 (优先使用)
+    pattern_with_lang = r"```([^\s`\n]+)[ \t]*\r?\n?([\s\S]*?)\r?\n?```"
+    matches = re.finditer(pattern_with_lang, response, re.DOTALL)
+    for match in matches:
+        lang = match.group(1).lower()
+        code = match.group(2).strip()
         code_blocks.append((code, lang))
     
     # 如果没找到任何代码块
