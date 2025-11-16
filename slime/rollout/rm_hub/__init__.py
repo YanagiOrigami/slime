@@ -47,6 +47,8 @@ async def async_rm(args, sample: Sample, **kwargs):
         return await remote_rm(args, sample)
     if rm_type == "remote_code_judge":
         return await remote_code_judge(response, label)
+    if rm_type == "remote_01_code_judge":
+        return await remote_01_code_judge(response, label)
     elif rm_type == "partial_credit_judge":
         return await partial_credit_judge(response, label)
     elif rm_type == "deepscaler":
