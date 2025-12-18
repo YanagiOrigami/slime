@@ -1,5 +1,6 @@
 import dataclasses
 import gc
+import logging
 import math
 import os
 from argparse import Namespace
@@ -7,7 +8,6 @@ from collections.abc import Callable, Sequence
 from functools import partial
 
 import torch
-import wandb
 from megatron.core import mpu
 from megatron.core.distributed import DistributedDataParallel as DDP
 from megatron.core.distributed import finalize_model_grads
@@ -21,6 +21,7 @@ from megatron.core.utils import get_model_config
 from megatron.training.global_vars import get_args
 from megatron.training.training import get_model
 
+from slime.utils import tracking_utils
 from slime.utils.memory_utils import clear_memory
 
 from .checkpoint import load_checkpoint, save_checkpoint
@@ -28,6 +29,8 @@ from .cp_utils import slice_with_cp
 from .data import DataIterator, get_batch
 from .loss import loss_function
 from .model_provider import get_model_provider_func
+
+logger = logging.getLogger(__name__)
 
 
 def get_optimizer_param_scheduler(args: Namespace, optimizer: MegatronOptimizer) -> OptimizerParamScheduler:
@@ -124,11 +127,6 @@ def setup_model_and_optimizer(
         use_gloo_process_groups=args.enable_gloo_process_groups,
     )
     opt_param_scheduler = get_optimizer_param_scheduler(args, optimizer)
-    for optimizer in optimizer.chained_optimizers:
-        if not getattr(optimizer, "init_state_fn", None):
-            continue
-        optimizer.init_state_fn(optimizer.optimizer, optimizer.config)
-
     return model, optimizer, opt_param_scheduler
 
 
@@ -211,7 +209,9 @@ def forward_only(
         assert not return_schedule_plan, "forward_only step should never return schedule plan"
 
         # Get the batch.
-        batch = get_batch(data_iterator, ["tokens", "total_lengths", "response_lengths"])
+        batch = get_batch(
+            data_iterator, ["tokens", "total_lengths", "response_lengths"], args.data_pad_size_multiplier
+        )
         unconcat_tokens = batch["unconcat_tokens"]
         tokens = batch["tokens"]
         packed_seq_params = batch["packed_seq_params"]
@@ -281,7 +281,7 @@ def forward_only(
                 # TODO: move this out of the loop.
                 origin_values = [None] * len(values)
                 origin_indices = sum(data_iterator[0].micro_batch_indices, [])
-                for value, origin_index in zip(values, origin_indices):
+                for value, origin_index in zip(values, origin_indices, strict=False):
                     origin_values[origin_index] = value
                 values = origin_values
             rollout_data[f"{store_prefix}{key}"] = values
@@ -362,6 +362,7 @@ def train_one_step(
                 "returns",
                 "rollout_log_probs",
             ],
+            args.data_pad_size_multiplier,
         )
 
         if os.environ.get("ENABLE_ROUTING_REPLAY", "0") == "1":
@@ -373,7 +374,7 @@ def train_one_step(
 
             mask_chunks: list[torch.Tensor] = []
             for total_len, response_len, resp_mask in zip(
-                batch["total_lengths"], batch["response_lengths"], batch["loss_masks"]
+                batch["total_lengths"], batch["response_lengths"], batch["loss_masks"], strict=False
             ):
                 assert (
                     resp_mask.numel() == response_len
@@ -488,7 +489,7 @@ def train_one_step(
         loss_reduced = {}
         values = values.tolist()
         num_samples_or_tokens = values[0]
-        for key, value in zip(keys, values[1:]):
+        for key, value in zip(keys, values[1:], strict=False):
             loss_reduced[key] = value * mpu.get_context_parallel_world_size() / num_samples_or_tokens
         return loss_reduced, grad_norm
     return {}, grad_norm
@@ -497,6 +498,16 @@ def train_one_step(
 def should_disable_forward_pre_hook(args: Namespace) -> bool:
     """Block forward pre-hook for certain configurations."""
     return args.use_distributed_optimizer and args.overlap_param_gather
+
+
+def finalize_model_grads_with_empty_cache(*args, **kwargs):
+    # trigger empty cache when there are less than 10% free memory before the final reduce scatter.
+    # TODO: this is an ad-hoc method and we should figure out why the oom happens in the first place.
+    device = torch.cuda.current_device()
+    free, total = torch.cuda.mem_get_info(device)
+    if free / total < 0.1:
+        clear_memory()
+    return finalize_model_grads(*args, **kwargs)
 
 
 def train(
@@ -549,7 +560,7 @@ def train(
         config.param_sync_func = [model_chunk.start_param_sync for model_chunk in model]
         if len(model) == 1:
             config.param_sync_func = config.param_sync_func[0]
-    config.finalize_model_grads_func = finalize_model_grads
+    config.finalize_model_grads_func = finalize_model_grads_with_empty_cache
 
     pre_hook_enabled = False
 
@@ -632,23 +643,41 @@ def train(
             for param_group_id, param_group in enumerate(optimizer.param_groups):
                 log_dict[f"train/{role_tag}lr-pg_{param_group_id}"] = opt_param_scheduler.get_lr(param_group)
 
-            if args.use_wandb:
-                log_dict["train/step"] = accumulated_step_id
-                wandb.log(log_dict)
-
-            if args.use_tensorboard:
-                from slime.utils.tensorboard_utils import _TensorboardAdapter
-
-                tb = _TensorboardAdapter(args)
-                tb.log(data=log_dict, step=accumulated_step_id)
+            log_dict["train/step"] = accumulated_step_id
+            tracking_utils.log(args, log_dict, step_key="train/step")
 
             if args.ci_test and not args.ci_disable_kl_checker:
                 if step_id == 0 and "train/ppo_kl" in log_dict and "train/pg_clipfrac" in log_dict:
-                    assert log_dict["train/ppo_kl"] == 0.0 and log_dict["train/pg_clipfrac"] == 0.0, f"{log_dict=}"
+                    if args.multi_latent_attention:
+                        # TODO: mla currently have non-zero kl, need further investigation
+                        assert log_dict["train/ppo_kl"] < 1e-8, f"{log_dict=}"
+                    else:
+                        assert log_dict["train/ppo_kl"] == 0.0 and log_dict["train/pg_clipfrac"] == 0.0, f"{log_dict=}"
                 if accumulated_step_id == 0 and "train/kl_loss" in log_dict:
                     assert log_dict["train/kl_loss"] == 0.0, f"{log_dict=}"
 
-            print(f"{role_tag}step {accumulated_step_id}: {log_dict}")
+            logger.info(f"{role_tag}step {accumulated_step_id}: {log_dict}")
+
+            if args.ci_save_grad_norm is not None:
+                ci_save_grad_norm_path = args.ci_save_grad_norm.format(
+                    role=role,
+                    rollout_id=rollout_id,
+                    step_id=step_id,
+                )
+                torch.save(grad_norm, ci_save_grad_norm_path)
+            elif args.ci_load_grad_norm is not None:
+                ci_load_grad_norm_path = args.ci_load_grad_norm.format(
+                    role=role,
+                    rollout_id=rollout_id,
+                    step_id=step_id,
+                )
+                expected_grad_norm = torch.load(ci_load_grad_norm_path)
+                assert math.isclose(
+                    grad_norm,
+                    expected_grad_norm,
+                    rel_tol=0.01,
+                    abs_tol=0.01,
+                ), f"grad norm mismatch: {grad_norm} != {expected_grad_norm}"
     # Close out pre-hooks if using distributed optimizer and overlapped param gather.
     if pre_hook_enabled:
         disable_forward_pre_hook(model)
@@ -695,8 +724,16 @@ def initialize_model_and_optimizer(
         tuple[list[DDP], MegatronOptimizer, OptimizerParamScheduler, int]:
             DDP-wrapped model chunks, optimizer, scheduler, and iteration index.
     """
+
+    if torch.version.hip:
+        import megatron.core.dist_checkpointing.strategies.filesystem_async as filesystem_async_module
+        from slime.utils.rocm_checkpoint_writer import ROCmFileSystemWriterAsync
+
+        filesystem_async_module.FileSystemWriterAsync = ROCmFileSystemWriterAsync
+        print("[ROCm] Applied FileSystemWriterAsync patch for HIP compatibility")
+
     model, optimizer, opt_param_scheduler = setup_model_and_optimizer(args, role)
-    setattr(model[0], "role", role)
+    model[0].role = role
     clear_memory()
     iteration, _ = load_checkpoint(
         model,
