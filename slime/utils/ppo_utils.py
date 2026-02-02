@@ -149,6 +149,7 @@ def compute_policy_loss(
 
 
 def compute_log_probs(logits: torch.Tensor, tokens: torch.Tensor, process_group: dist.ProcessGroup | None):
+    # TODO: when megatron is not installed, fall back to naive implementation
     from megatron.core.fusions.fused_cross_entropy import fused_vocab_parallel_cross_entropy
 
     # convert to [seq_len, batch_size, vocab_size] as expected by fused_vocab_parallel_cross_entropy
@@ -250,9 +251,10 @@ def get_reinforce_plus_plus_returns(
             full_kl_response = local_kl_chunk
 
         # Step 3: Compute returns on full response kl tensor.
-        token_level_rewards = -kl_coef * full_kl_response
         full_mask = loss_masks[i]
         assert full_mask.sum().item() > 0, f"Sequence at index {i} is fully masked."
+        masked_kl = full_kl_response * full_mask
+        token_level_rewards = -kl_coef * masked_kl
         last_idx = full_mask.nonzero(as_tuple=True)[0][-1]
         token_level_rewards[last_idx] += rewards[i]
 
@@ -644,21 +646,35 @@ def chunked_gae(
     return advantages, returns
 
 
-def calculate_log_probs_and_entropy(logits, tokens, tp_group, with_entropy: bool = False):
+def calculate_log_probs_and_entropy(logits, tokens, tp_group, with_entropy: bool = False, chunk_size: int = -1):
     logits = logits.contiguous()
     # TODO: not sure why we need to clone the logits here.
     # Without the clone, the backward will trigger inplace edit error.
     # It seems that the function with tp will modify the logits inplace.
+    entropy = None
     if logits.size(0) != 0:
-        log_prob = compute_log_probs(logits.clone(), tokens, tp_group)
+        if chunk_size > 0:
+            num_chunks = (logits.size(0) - 1) // chunk_size + 1
+            tokens_chunks = tokens.chunk(num_chunks, dim=0)
+            logits_chunks = logits.chunk(num_chunks, dim=0)
+            log_probs = []
+            for tokens_chunk, logits_chunk in zip(tokens_chunks, logits_chunks, strict=True):
+                log_prob = compute_log_probs(logits_chunk.clone(), tokens_chunk, tp_group)
+                log_probs.append(log_prob)
+            log_prob = torch.cat(log_probs, dim=0)
+            if with_entropy:
+                entropys = []
+                for _, logits_chunk in zip(tokens_chunks, logits_chunks, strict=True):
+                    entropy = compute_entropy_from_logits(logits_chunk.clone(), tp_group)
+                    entropys.append(entropy)
+                entropy = torch.cat(entropys, dim=0)
+        else:
+            log_prob = compute_log_probs(logits.clone(), tokens, tp_group)
+            if with_entropy:
+                entropy = compute_entropy_from_logits(logits.clone(), tp_group)
     else:
         log_prob = logits.new_zeros((0,))
-
-    if with_entropy:
-        if logits.size(0) != 0:
-            entropy = compute_entropy_from_logits(logits.clone(), tp_group)
-        else:
+        if with_entropy:
             entropy = logits.new_zeros((0,))
-    else:
-        entropy = None
+
     return log_prob, entropy
