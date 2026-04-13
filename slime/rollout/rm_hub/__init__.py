@@ -1,4 +1,5 @@
 import asyncio
+import json
 import logging
 import random
 
@@ -16,6 +17,7 @@ from .math_dapo_utils import compute_score as compute_score_dapo
 from .math_utils import extract_answer as extract_boxed_answer
 from .math_utils import grade_answer_verl
 from .remote_code_judge import remote_code_judge, partial_credit_judge, remote_01_code_judge
+from .livecodebench import evaluate_single_example as livecodebench_compute_score
 
 _shared_session: aiohttp.ClientSession | None = None
 
@@ -30,6 +32,42 @@ def _get_shared_session() -> aiohttp.ClientSession:
         timeout = aiohttp.ClientTimeout(total=120)
         _shared_session = aiohttp.ClientSession(connector=connector, timeout=timeout)
     return _shared_session
+
+
+def _parse_json_dict(raw_value):
+    if isinstance(raw_value, dict):
+        return raw_value
+    if not isinstance(raw_value, str):
+        return None
+
+    raw_value = raw_value.strip()
+    if not raw_value:
+        return None
+
+    try:
+        parsed = json.loads(raw_value)
+    except json.JSONDecodeError:
+        return None
+    return parsed if isinstance(parsed, dict) else None
+
+
+def _get_livecodebench_problem(label, metadata: dict) -> dict | None:
+    problem = _parse_json_dict(label)
+    if problem is None and isinstance(metadata, dict):
+        for key in ("livecodebench_problem", "problem"):
+            problem = _parse_json_dict(metadata.get(key))
+            if problem is not None:
+                break
+        if problem is None and {"test", "is_stdin"}.issubset(metadata):
+            problem = metadata
+
+    if problem is None:
+        return None
+
+    if "test" not in problem or "is_stdin" not in problem:
+        return None
+
+    return problem
 
 
 async def remote_rm(args, sample: Sample, max_retries: int = 10):
@@ -70,9 +108,9 @@ async def async_rm(args, sample: Sample, **kwargs):
     # Implement the actual logic as needed.
     if rm_type == "remote_rm":
         return await remote_rm(args, sample)
-    if rm_type == "remote_code_judge":
+    elif rm_type == "remote_code_judge":
         return await remote_code_judge(response, label)
-    if rm_type == "remote_01_code_judge":
+    elif rm_type == "remote_01_code_judge":
         return await remote_01_code_judge(response, label)
     elif rm_type == "partial_credit_judge":
         return await partial_credit_judge(response, label)
@@ -90,6 +128,12 @@ async def async_rm(args, sample: Sample, **kwargs):
         from .ifbench import compute_ifbench_reward
 
         return compute_ifbench_reward(response, label, metadata=metadata)
+    elif rm_type == "livecodebench":
+        problem = _get_livecodebench_problem(label, metadata)
+        if problem is None:
+            logger.warning("livecodebench rm expects label/metadata with `test` and `is_stdin`, got label=%r", label)
+            return 0.0
+        return float(await livecodebench_compute_score(problem, response))
     elif rm_type == "random":
         return random.randint(0, 1)
     elif rm_type:

@@ -35,6 +35,7 @@ NUM_GPUS = 0
 from slime.rollout.base_types import RolloutFnEvalOutput, call_rollout_fn
 from slime.rollout.data_source import RolloutDataSourceWithBuffer
 from slime.rollout.filter_hub.base_types import DynamicFilterOutput, call_dynamic_filter
+import slime.rollout.rm_hub as rm_hub
 from slime.rollout.rm_hub import async_rm, batched_async_rm
 from slime.rollout.sglang_rollout import generate_rollout as default_generate_rollout
 from slime.utils.misc import load_function
@@ -314,6 +315,35 @@ def test_custom_rm_default_behavior_is_stable():
     )
     assert isinstance(reward, (int, float))
     assert isinstance(rewards, list) and len(rewards) == 2
+
+
+@pytest.mark.parametrize(
+    "label,metadata",
+    [
+        ('{"test": [], "is_stdin": false}', {}),
+        ("unused", {"livecodebench_problem": {"test": [], "is_stdin": True}}),
+    ],
+)
+def test_livecodebench_rm_aligns_with_async_entrypoint(monkeypatch, label, metadata):
+    seen = {}
+
+    async def fake_livecodebench_compute_score(problem, response):
+        seen["problem"] = problem
+        seen["response"] = response
+        return True
+
+    monkeypatch.setattr(rm_hub, "livecodebench_compute_score", fake_livecodebench_compute_score)
+
+    sample = make_sample(7)
+    sample.label = label
+    sample.metadata = metadata
+    sample.response = "def solve():\n    return 1"
+
+    reward = asyncio.run(async_rm(make_args(rm_type="livecodebench"), sample))
+
+    assert reward == 1.0
+    assert seen["problem"] == (metadata.get("livecodebench_problem") or {"test": [], "is_stdin": False})
+    assert seen["response"] == sample.response
 
 
 def test_custom_rm_path_aligns_with_expected_format():
